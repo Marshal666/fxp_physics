@@ -1,0 +1,40 @@
+name: Physics and deterministic replay
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: windows-latest, compiler: cl }
+          - { os: ubuntu-latest, compiler: g++ }
+          - { os: ubuntu-latest, compiler: clang++ }
+        build_type: [Debug, Release]
+        portable: ["OFF", "ON"]
+    runs-on: ${{ matrix.platform.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+        with:
+          arch: x64
+      - name: Configure
+        run: >-
+          cmake -S . -B build/ci -G Ninja
+          -DCMAKE_CXX_COMPILER=${{ matrix.platform.compiler }}
+          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+          -DFXP_PORTABLE_ONLY=${{ matrix.portable }}
+          -DFXP_DISABLE_SSE2=${{ matrix.portable }}
+      - run: cmake --build build/ci --parallel
+      - run: ctest --test-dir build/ci --output-on-failure
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: cmake -S . -B build/sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DFXP_PHYSICS_SANITIZERS=ON
+      - run: cmake --build build/sanitize --parallel
+      - run: ctest --test-dir build/sanitize --output-on-failure
