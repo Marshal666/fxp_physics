@@ -1,5 +1,6 @@
 #include "detail.hpp"
 #include <numeric>
+#include <set>
 
 namespace fxp_physics {
 using namespace detail;
@@ -231,11 +232,13 @@ Bounds bounds(const Shape::Data &s, Pose p) {
     return transformed(s.bounds, p);
 }
 std::vector<std::uint32_t> triangles(const Shape::Data &s, Pose p, Bounds area) {
+    // Convex primitives have no triangle tree: avoid transforming its query
+    // bounds for every broadphase pair.
+    if (s.type != ShapeType::mesh && s.type != ShapeType::heightfield)
+        return {0xffffffffu};
     const Bounds local = transformed(area, relative(p, Pose{}));
     if (s.type == ShapeType::mesh)
         return s.tree.query(local);
-    if (s.type != ShapeType::heightfield)
-        return {0xffffffffu};
     if (!s.bounds.intersects(local))
         return {};
     const auto cell = [&](Real v, std::uint32_t maximum) {
@@ -303,7 +306,15 @@ Separation separate(const Geometry &a, const Geometry &b) {
         result.point_b = closest.second - result.normal * b.radius;
         return result;
     }
+    // Exact duplicate axes cannot improve the strict maximum below. Fold
+    // opposite signs too, preserving the first tested orientation and all ties.
+    std::set<std::tuple<Real, Real, Real>> tested_axes;
     const auto axis = [&](Vec3 n) {
+        if (zero(n))
+            return;
+        const Vec3 key = (n.x < 0 || (n.x == 0 && (n.y < 0 || (n.y == 0 && n.z < 0)))) ? -n : n;
+        if (!tested_axes.emplace(key.x, key.y, key.z).second)
+            return;
         if (length(n) < 0.0000001_r)
             return;
         n = unit(n);
@@ -323,10 +334,23 @@ Separation separate(const Geometry &a, const Geometry &b) {
     for (auto n : b.normals)
         axis(n);
     if (!a.rounded && !b.rounded) {
-        for (const auto ea : a.edges)
-            for (const auto eb : b.edges)
-                axis(cross(unit(a.vertices[ea.second] - a.vertices[ea.first]),
-                           unit(b.vertices[eb.second] - b.vertices[eb.first])));
+        // Normalize each edge once, not twice for every edge pair. Identical
+        // fixed-point directions produce identical axes; retain first occurrence
+        // order so separation ties and rounding remain unchanged.
+        const auto directions = [](const Geometry &g) {
+            std::vector<Vec3> out;
+            out.reserve(g.edges.size());
+            for (const auto edge : g.edges) {
+                const Vec3 direction = unit(g.vertices[edge.second] - g.vertices[edge.first]);
+                if (std::find(out.begin(), out.end(), direction) == out.end())
+                    out.push_back(direction);
+            }
+            return out;
+        };
+        const auto da = directions(a), db = directions(b);
+        for (const auto ea : da)
+            for (const auto eb : db)
+                axis(cross(ea, eb));
     } else {
         const auto &round = a.rounded ? a : b;
         const auto &poly = a.rounded ? b : a;

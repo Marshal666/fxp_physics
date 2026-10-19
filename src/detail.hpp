@@ -205,7 +205,11 @@ struct World::Impl {
     void wake_all();
     void wake_connected(BodyId id);
     void invalidate(BodyId id);
-    Vec3 com(const Body &b) const { return detail::transform(b.desc.pose, b.desc.center_of_mass); }
+    Vec3 com(const Body &b) const {
+        // The usual origin-centred body needs no quaternion rotation here.
+        return detail::zero(b.desc.center_of_mass) ? b.desc.pose.position
+                                                  : detail::transform(b.desc.pose, b.desc.center_of_mass);
+    }
     Vec3 angular_mass(const Body &b, Vec3 v) const;
     Vec3 point_velocity(const Body &b, Vec3 point) const;
     void impulse(Body &b, Vec3 value, Vec3 point);

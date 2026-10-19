@@ -1,5 +1,6 @@
 #include "detail.hpp"
 #include <numeric>
+#include <optional>
 
 namespace fxp_physics {
 using namespace detail;
@@ -542,6 +543,19 @@ void World::Impl::find_contacts() {
     pairs.clear();
     stats.broadphase_pairs = 0;
     std::vector<bool> matched(previous.size(), false);
+    // Collider poses are immutable during contact discovery. Reuse each convex
+    // collider's transformed vertices/normals across all of its candidate pairs.
+    std::vector<std::optional<Geometry>> cooked(colliders.size());
+    const auto geometry_for = [&](std::size_t index, std::uint32_t triangle, Geometry &temporary) -> const Geometry & {
+        const auto &shape = colliders[index].desc.shape->data();
+        if (concave(shape.type)) {
+            temporary = geometry(shape, proxies[index].pose, triangle);
+            return temporary;
+        }
+        if (!cooked[index])
+            cooked[index] = geometry(shape, proxies[index].pose, triangle);
+        return *cooked[index];
+    };
     std::vector<std::pair<BodyId, BodyId>> excluded;
     for (const auto &s : springs)
         if (!s.desc.collide_connected && s.desc.body_b)
@@ -574,8 +588,9 @@ void World::Impl::find_contacts() {
             bool paired = false;
             for (auto ai : ta)
                 for (auto bi : tb) {
-                    const auto ga = geometry(ca.desc.shape->data(), pa.pose, ai),
-                               gb = geometry(cb.desc.shape->data(), pb.pose, bi);
+                    Geometry temporary_a, temporary_b;
+                    const auto &ga = geometry_for(i, ai, temporary_a);
+                    const auto &gb = geometry_for(j, bi, temporary_b);
                     const auto sep = separate(ga, gb);
                     const bool sensor = ca.desc.sensor || cb.desc.sensor;
                     if (sep.distance > (sensor ? 0_r : config.contact_margin))
