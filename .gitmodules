@@ -1,0 +1,3 @@
+[submodule "external/fxp_math"]
+	path = external/fxp_math
+	url = https://github.com/Marshal666/fxp_math.git
