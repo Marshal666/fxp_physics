@@ -205,6 +205,12 @@ class World {
     bool layer_collision(std::uint8_t a, std::uint8_t b) const;
     void wake(BodyId id);
 
+    // Execution setting only; excluded from snapshots and state checksums.
+    // Zero selects automatic parallelism (at most eight workers), one is serial.
+    // The configured count is preserved by load; results are independent of it.
+    void set_worker_count(std::uint32_t count);
+    std::uint32_t worker_count() const noexcept;
+
     void step(const std::function<void(World &)> &fixed_update = {});
     const std::vector<CollisionEvent> &events() const noexcept;
     void dispatch_events(const std::function<void(const CollisionEvent &)> &callback) const;

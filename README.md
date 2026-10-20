@@ -22,15 +22,15 @@ ticks, random state, and serialized bytes. The viewer is not a dependency.
   and versioned self-contained save/load as `std::vector<std::uint8_t>`.
 - Headless behavior tests and a frozen per-tick state/query determinism trace.
 
-This is an initial implementation with deliberately bounded inputs, a single
-simulation thread, and no viewer integration. It is intended to be measured
-against actual game workloads before production use.
+This is an initial implementation with deliberately bounded inputs and independent
+island parallelism. It is intended to be measured against actual game workloads
+before production use.
 
 ## Build
 
 Clone with `--recurse-submodules`, or run `git submodule update --init --recursive`.
 The nested dependency is pinned to fxp_math commit
-`f18e16b2f6c404da51075ce013315369096cbf98`. Dependency tests are not rebuilt by default.
+`028198c02fc88852c22d484120ee7da12a62e6b6`. Dependency tests are not rebuilt by default.
 
 Windows, including VS 2026, from an ordinary PowerShell:
 
@@ -58,9 +58,9 @@ ctest --preset linux-release
 
 Use `-DCMAKE_CXX_COMPILER=clang++` in a separate build directory to select Clang.
 `FXP_PHYSICS_SANITIZERS=ON` enables address/undefined-behavior sanitizers on GCC/Clang.
-CI checks Windows/MSVC and Linux/GCC/Clang, Debug/Release, and native/portable
-integer arithmetic against **the same** reference file. Linux CI is provided;
-this workspace's implementation was exercised locally on Windows.
+CI checks Windows/MSVC, Linux/GCC/Clang and macOS ARM, Debug/Release, and
+native/portable integer arithmetic against **the same** reference files.
+See the performance report for local validation results and pending CI coverage.
 
 Embed in a game:
 
@@ -118,7 +118,17 @@ automatic catch-up policy. The host owns scheduling and its ordered command log.
 Mutation is permitted between steps or inside the fixed-update callback. Event
 and render callbacks are read-only and reject mutations, including RNG consumption.
 Do not move/destroy the world or retain references to callback pose arguments
-while a callback is executing. The world and its queries are not thread-safe.
+while a callback is executing. The world and its queries are not thread-safe for
+concurrent host calls. Internal workers finish before `step()` returns.
+
+`world.set_worker_count(1)` selects serial execution; `4` permits four workers.
+The default `0` uses the hardware concurrency, capped at eight. Small workloads
+run serially to avoid scheduling overhead. Independent dynamic islands retain
+their contact and spring ordering, so results do not depend on worker count.
+Static and kinematic bodies are shared read-only during solving. A single
+connected pile is one island and currently receives no solver parallelism.
+Worker count is an execution setting, excluded from snapshots and checksums;
+`load()` preserves the destination world's configured count.
 
 `set_kinematic_target` reaches the target over the next tick, derives contact
 velocities from that motion, and stops afterward. `set_velocity` instead persists
@@ -163,11 +173,20 @@ The broadphase uses a deterministic median AABB tree. Changed bounds refit the
 tree; structural changes and every 32 refits rebuild its spatial partition.
 Query candidates remain sorted by collider ID regardless of tree topology.
 Unchanged colliders retain their bounds and cooked convex geometry.
+Candidate queries, geometry preparation and contact generation use independent
+jobs. Contact results merge in collider-ID order after the workers finish;
+shared geometry caches are prepared before contact jobs read them.
+Unchanged inactive pairs also retain their contact manifolds. An entirely
+stationary world skips broadphase and narrowphase work while retaining collision
+events. Incoming active bodies still discover and wake sleeping islands.
 Static meshes have a cooked local BVH; terrain queries traverse affected cells.
 Primitive and hull contact tests use analytic segment distances and separating
-axes. Face clipping creates up to four contact points per convex pair; triangle
+axes. Box pairs use a specialized oriented-box test and bounded face clipping.
+Face clipping creates up to four contact points per convex pair; triangle
 contacts may produce several manifolds. The solver uses warm-started sequential
-impulses with two friction tangents and fixed iteration counts. Friction combines
+impulses with two friction tangents and fixed iteration counts. Body inertia
+responses, contact Jacobians and effective masses are prepared before iteration;
+inactive constraints do not prepare solver rows. Friction combines
 by geometric mean; restitution combines by maximum. Springs use a soft distance
 constraint parameterized by frequency and damping ratio, with a force cap.
 
@@ -217,6 +236,11 @@ does not affect bytes: shapes are serialized by value for each collider.
 Snapshots have a 256 MiB size limit. This initial encoding favors a simple contract
 over compression or deduplicating large assets.
 
+Simulation/save version **2** introduces different box contact generation and
+fixed-point solver rounding. Trajectories can differ from version 1, whose saves
+are rejected explicitly. Version 2 retains deterministic continuation within the
+same engine version, including when changing worker counts after loading.
+
 Load validates into a temporary world, including IDs, references, shapes and
 numeric invariants, then swaps it into place. Failed loads leave the original
 world intact. Incompatible versions are rejected, with no implicit migration.
@@ -253,7 +277,7 @@ Host exceptions in fixed-update callbacks similarly leave their already-applied
 commands in place; callbacks should normally not throw.
 
 Cloth, general joints/ragdolls, continuous collision detection, rotating casts,
-runtime fracture, multithreading, and rollback APIs are not implemented.
+runtime fracture, parallel solving within one island, and rollback APIs are not implemented.
 
 ## Validation and performance
 
@@ -281,7 +305,10 @@ never regenerate it as part of configure/build/test.
 `fxp_physics_benchmark` runs without the viewer, window system or downloaded
 dependencies. It reproduces the viewer's physics playground and provides sparse
 kinematic/dynamic spheres and eight-box stacks at 100, 500, 1,000, 5,000 and
-10,000 moving bodies. All use 60 Hz, four substeps and 12 velocity iterations.
+10,000 moving bodies. Defaults are 60 Hz, four substeps and 12 velocity iterations.
+Use `--hz 20` to measure 20 Hz physics; `--substeps`, `--iterations` and `--workers`
+control the remaining settings. The `pile` scene places towers side by side to
+exercise a connected contact graph.
 Build it with `FXP_PHYSICS_BUILD_BENCHMARKS=ON`; tests also build it for replay
 validation.
 
@@ -289,20 +316,29 @@ validation.
 ./build/linux-release/fxp_physics_benchmark --scene playground --ticks 240 --samples 3
 ./build/linux-release/fxp_physics_benchmark --scene dynamic --bodies 10000 --ticks 120 --samples 3 --queries 100
 ./build/linux-release/fxp_physics_benchmark --suite scaling --ticks 10 --samples 2 > scaling.csv
+./build/linux-release/fxp_physics_benchmark --scene stack --bodies 10000 --hz 20 --workers 4 --ticks 120 --samples 3
+./build/linux-release/fxp_physics_benchmark --scene stack --bodies 10000 --hz 20 --phase settled --ticks 120 --samples 3
+./build/linux-release/fxp_physics_benchmark --scene stack --bodies 10000 --hz 20 --phase disturbed --ticks 120 --samples 3
 ```
 
 CSV output includes mean, median, p95 and maximum tick time, contact/candidate
-counts and full-state/query checksums. Construction, statistics, hashing and
+counts, starting/ending awake counts and full-state/query/event trace checksums.
+Construction, statistics, hashing and
 trace I/O are outside the timed region. Optional overlap queries are timed.
 Each sample recreates the same scene and must end with identical checksums.
 Use `--warmup N` to measure a later simulation interval; timings do not control
-the number of simulated ticks.
+the number of simulated ticks. `--phase settled` defaults to 600 warmup ticks;
+`--phase disturbed` then applies an impulse to one tower. Always check the awake
+counts: a warmup interval alone does not establish that a scene has settled.
 
-`tests/playground_reference.csv` adds 240 frozen state/query/event rows captured
-from the original engine before these optimizations. CI checks both reference
+`tests/playground_reference.csv` adds 240 frozen state/query/event rows.
+Both references are maintained explicitly for the current simulation version,
+after behavior and native/portable equivalence tests pass. CI checks both reference
 files on GCC, Clang, MSVC and macOS ARM, Debug/Release, native/portable arithmetic.
-Release artifacts also compare all five populations across platforms and
-backends. Timing numbers are reported, not used as flaky CI pass/fail limits.
+Release artifacts also compare all five populations across platforms,
+backends and one versus four workers, including 20 Hz awake, settled and disturbed
+cases. A separate ThreadSanitizer job exercises the worker and contact-cache tests.
+Timing numbers are reported, not used as flaky CI pass/fail limits.
 The viewer repository has its own workflow because nested submodule workflows
 do not run on a viewer push.
 

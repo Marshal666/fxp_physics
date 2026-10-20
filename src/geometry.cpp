@@ -231,6 +231,39 @@ Geometry geometry(const Shape::Data &s, Pose p, std::uint32_t triangle) {
         g.center = p.position;
         return g;
     }
+    if (s.type == ShapeType::box) {
+        // Keep the generic polyhedron representation for box/mesh and rounded
+        // pairs, but cache the three OBB directions for the common box pair.
+        // Building vertices from the same half axes makes the analytic support
+        // calculation and clipped faces describe the same fixed-point box.
+        g.box = true;
+        g.center = p.position;
+        for (unsigned i = 0; i < 3; ++i) {
+            // Rotate the unit basis independently. Normalizing a very short
+            // half axis would amplify its rounding error for thin, wide boxes.
+            Vec3 basis{};
+            basis[i] = 1;
+            g.box_axes[i] = unit(p.rotation.rotate(basis));
+            g.box_half_axes[i] = g.box_axes[i] * s.half_extents[i];
+        }
+        g.faces = s.faces;
+        g.edges = s.edges;
+        g.vertices.reserve(8);
+        g.centered_vertices.reserve(8);
+        for (unsigned i = 0; i < 8; ++i) {
+            const Vec3 offset = ((i & 1) ? g.box_half_axes[0] : -g.box_half_axes[0]) +
+                                ((i & 2) ? g.box_half_axes[1] : -g.box_half_axes[1]) +
+                                ((i & 4) ? g.box_half_axes[2] : -g.box_half_axes[2]);
+            g.vertices.push_back(p.position + offset);
+            g.centered_vertices.push_back(g.vertices.back() - g.center);
+        }
+        g.normals.reserve(6);
+        for (const auto axis : g.box_axes) {
+            g.normals.push_back(-axis);
+            g.normals.push_back(axis);
+        }
+        return g;
+    }
     if (s.type == ShapeType::mesh) {
         const auto t = s.mesh_triangles.at(triangle);
         g.vertices = {transform(p, s.vertices[t.a]), transform(p, s.vertices[t.b]),
@@ -262,6 +295,17 @@ Bounds bounds(const Shape::Data &s, Pose p) {
     if (s.type == ShapeType::sphere) {
         const Vec3 r{s.radius, s.radius, s.radius};
         return {p.position - r, p.position + r};
+    }
+    if (s.type == ShapeType::box) {
+        // Use the same rounded basis as geometry(). Summed absolute half axes
+        // enclose all eight corners exactly, including thin rotated boxes.
+        Vec3 extent{};
+        for (unsigned i = 0; i < 3; ++i) {
+            Vec3 basis{};
+            basis[i] = 1;
+            extent += abs(unit(p.rotation.rotate(basis)) * s.half_extents[i]);
+        }
+        return {p.position - extent, p.position + extent};
     }
     return transformed(s.bounds, p);
 }
@@ -378,7 +422,55 @@ static std::pair<Vec3, Vec3> closest_segments(Vec3 a, Vec3 b, Vec3 c, Vec3 d) {
     }
     return {a + u * s, c + v * t};
 }
+static Vec3 box_support(const Geometry &box, Vec3 direction) {
+    unsigned vertex = 0;
+    for (unsigned i = 0; i < 3; ++i)
+        if (dot(box.box_half_axes[i], direction) > 0)
+            vertex |= 1u << i;
+    return box.vertices[vertex];
+}
+static Separation separate_boxes(const Geometry &a, const Geometry &b, Real rejection_threshold) {
+    Separation result;
+    const Vec3 delta = b.center - a.center;
+    const auto axis = [&](Vec3 normal, std::int32_t feature) {
+        Real radius_a{}, radius_b{};
+        for (unsigned i = 0; i < 3; ++i) {
+            radius_a += fxp::abs(dot(a.box_half_axes[i], normal));
+            radius_b += fxp::abs(dot(b.box_half_axes[i], normal));
+        }
+        const Real center_distance = dot(delta, normal);
+        const Real distance = fxp::abs(center_distance) - radius_a - radius_b;
+        if (distance > result.distance) {
+            result.distance = distance;
+            result.normal = center_distance < 0 ? -normal : normal;
+            result.box_axis = feature;
+        }
+        return distance > rejection_threshold;
+    };
+    for (unsigned i = 0; i < 3; ++i)
+        if (axis(a.box_axes[i], static_cast<std::int32_t>(i)))
+            return result;
+    // Identically oriented boxes need only three axes. This covers undeformed
+    // stacks and avoids testing twelve exact duplicates.
+    if (a.box_axes != b.box_axes) {
+        for (unsigned i = 0; i < 3; ++i)
+            if (axis(b.box_axes[i], static_cast<std::int32_t>(3 + i)))
+                return result;
+        for (unsigned i = 0; i < 3; ++i)
+            for (unsigned j = 0; j < 3; ++j) {
+                const Vec3 normal = cross(a.box_axes[i], b.box_axes[j]);
+                if (!tiny_axis(normal) &&
+                    axis(unit(normal), static_cast<std::int32_t>(6 + i * 3 + j)))
+                    return result;
+            }
+    }
+    result.point_a = box_support(a, result.normal);
+    result.point_b = box_support(b, -result.normal);
+    return result;
+}
 Separation separate(const Geometry &a, const Geometry &b, Real rejection_threshold) {
+    if (a.box && b.box)
+        return separate_boxes(a, b, rejection_threshold);
     Separation result;
     if (a.rounded && b.rounded) {
         const auto closest = closest_segments(a.a, a.b, b.a, b.b);
@@ -466,7 +558,167 @@ static std::vector<Vec3> clip(std::vector<Vec3> polygon, Vec3 origin, Vec3 norma
     }
     return out;
 }
+static void finish_manifold(std::vector<ContactPoint> &out) {
+    std::sort(out.begin(), out.end(), [](const auto &x, const auto &y) {
+        return std::tie(x.point.x, x.point.y, x.point.z, x.separation) <
+               std::tie(y.point.x, y.point.y, y.point.z, y.separation);
+    });
+    // Approximate equality is not transitive. Compact in the specified sorted
+    // order, without allocating a second vector for every contact patch.
+    std::size_t distinct = 0;
+    for (const auto &point : out) {
+        bool duplicate = false;
+        for (std::size_t i = 0; i < distinct; ++i)
+            if (!length_greater_than(point.point - out[i].point, 0.0001_r - Real::epsilon())) {
+                duplicate = true;
+                break;
+            }
+        if (!duplicate)
+            out[distinct++] = point;
+    }
+    out.resize(distinct);
+    if (out.size() > 4) {
+        // Deepest point, then maximum distance from the chosen set. Ties retain
+        // lexicographic order. This keeps the contact patch spatially distributed.
+        std::array<ContactPoint, 4> reduced{};
+        auto deepest = std::min_element(
+            out.begin(), out.end(), [](const auto &x, const auto &y) { return x.separation < y.separation; });
+        reduced[0] = *deepest;
+        out.erase(deepest);
+        for (unsigned count = 1; count < reduced.size(); ++count) {
+            std::size_t best = 0;
+            Real distance = -1_r;
+            for (std::size_t i = 0; i < out.size(); ++i) {
+                Real minimum_distance = Real::max();
+                for (unsigned j = 0; j < count; ++j)
+                    minimum_distance = (std::min)(minimum_distance, length(out[i].point - reduced[j].point));
+                if (minimum_distance > distance) {
+                    distance = minimum_distance;
+                    best = i;
+                }
+            }
+            reduced[count] = out[best];
+            out.erase(out.begin() + static_cast<std::ptrdiff_t>(best));
+        }
+        out.assign(reduced.begin(), reduced.end());
+    }
+}
+static std::pair<Vec3, Vec3> supporting_box_edge(const Geometry &box, unsigned axis, Vec3 direction) {
+    Vec3 center = box.center;
+    for (unsigned i = 0; i < 3; ++i)
+        if (i != axis)
+            center += dot(box.box_half_axes[i], direction) > 0 ? box.box_half_axes[i] : -box.box_half_axes[i];
+    return {center - box.box_half_axes[axis], center + box.box_half_axes[axis]};
+}
+static std::vector<ContactPoint> generic_box_manifold(const Geometry &a, const Geometry &b, Separation s,
+                                                     Real margin) {
+    auto generic = a;
+    generic.box = false;
+    return manifold(generic, b, s, margin);
+}
+static std::vector<ContactPoint> box_manifold(const Geometry &a, const Geometry &b, Separation s,
+                                             Real margin) {
+    std::vector<ContactPoint> out;
+    if (s.box_axis >= 6) {
+        // An edge cross product can win by a few raw units while its normal
+        // is almost parallel to a face. Keep the full SAT witness for casts,
+        // but preserve a broad support patch for resting/slightly tilted
+        // boxes instead of balancing a tower on one noisy edge point.
+        Real alignment = 0.999_r;
+        for (unsigned i = 0; i < 6; ++i) {
+            const auto &box = i < 3 ? a : b;
+            const Real next = fxp::abs(dot(box.box_axes[i % 3], s.normal));
+            if (next > alignment) {
+                alignment = next;
+                s.box_axis = static_cast<std::int32_t>(i);
+            }
+        }
+    }
+    if (s.box_axis >= 6) {
+        const unsigned axis_a = static_cast<unsigned>(s.box_axis - 6) / 3,
+                       axis_b = static_cast<unsigned>(s.box_axis - 6) % 3;
+        const auto edge_a = supporting_box_edge(a, axis_a, s.normal),
+                   edge_b = supporting_box_edge(b, axis_b, -s.normal);
+        const auto closest = closest_segments(edge_a.first, edge_a.second, edge_b.first, edge_b.second);
+        out.push_back({(closest.first + closest.second) / 2_r, s.distance});
+        return out;
+    }
+    const bool use_a = s.box_axis < 3;
+    const auto &reference = use_a ? a : b;
+    const auto &incident = use_a ? b : a;
+    const unsigned ref_axis = static_cast<unsigned>(s.box_axis) % 3;
+    const Vec3 toward_incident = use_a ? s.normal : -s.normal;
+    const Vec3 normal = dot(reference.box_axes[ref_axis], toward_incident) > 0
+                            ? reference.box_axes[ref_axis] : -reference.box_axes[ref_axis];
+    const Vec3 origin = reference.center +
+                        (dot(reference.box_axes[ref_axis], normal) > 0
+                             ? reference.box_half_axes[ref_axis]
+                             : -reference.box_half_axes[ref_axis]);
+    unsigned inc_axis = 0;
+    Real alignment = fxp::abs(dot(incident.box_axes[0], normal));
+    for (unsigned i = 1; i < 3; ++i) {
+        const Real next = fxp::abs(dot(incident.box_axes[i], normal));
+        if (next > alignment) {
+            inc_axis = i;
+            alignment = next;
+        }
+    }
+    const unsigned inc_face = inc_axis * 2 + (dot(incident.box_axes[inc_axis], normal) < 0 ? 1u : 0u);
+    // A quadrilateral clipped against four planes has at most eight vertices.
+    // Two fixed buffers avoid four allocations per face contact.
+    std::array<Vec3, 8> polygon{}, temporary{};
+    std::size_t count = 4;
+    for (unsigned i = 0; i < 4; ++i)
+        polygon[i] = incident.vertices[incident.faces[inc_face][i]];
+    for (unsigned i = 0; i < 3 && count != 0; ++i) {
+        if (i == ref_axis)
+            continue;
+        for (const bool positive : {false, true}) {
+            const Vec3 side = positive ? reference.box_axes[i] : -reference.box_axes[i];
+            const Vec3 plane = reference.center +
+                               (positive ? reference.box_half_axes[i] : -reference.box_half_axes[i]);
+            std::size_t next_count = 0;
+            Vec3 previous = polygon[count - 1];
+            Real pd = dot(previous - plane, side);
+            for (std::size_t vertex = 0; vertex < count; ++vertex) {
+                const Vec3 current = polygon[vertex];
+                const Real cd = dot(current - plane, side);
+                if ((pd <= 0) != (cd <= 0)) {
+                    // Rounding at nearly coincident edges can make the
+                    // polygon slightly nonconvex. Retain a safe generic
+                    // fallback if that invalidates the eight-vertex bound.
+                    if (next_count == temporary.size())
+                        return generic_box_manifold(a, b, s, margin);
+                    temporary[next_count++] = previous + (current - previous) * (pd / (pd - cd));
+                }
+                if (cd <= 0) {
+                    if (next_count == temporary.size())
+                        return generic_box_manifold(a, b, s, margin);
+                    temporary[next_count++] = current;
+                }
+                previous = current;
+                pd = cd;
+            }
+            count = next_count;
+            polygon.swap(temporary);
+            if (count == 0)
+                break;
+        }
+    }
+    out.reserve(count == 0 ? 1 : count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const Real distance = dot(polygon[i] - origin, normal);
+        if (distance <= margin)
+            out.push_back({polygon[i] - normal * (distance / 2_r), distance});
+    }
+    if (out.empty())
+        out.push_back({(s.point_a + s.point_b) / 2_r, s.distance});
+    finish_manifold(out);
+    return out;
+}
 std::vector<ContactPoint> manifold(const Geometry &a, const Geometry &b, Separation s, Real margin) {
+    if (a.box && b.box && s.box_axis >= 0)
+        return box_manifold(a, b, s, margin);
     std::vector<ContactPoint> out;
     if (a.rounded || b.rounded) {
         if (a.rounded && b.rounded)
@@ -574,52 +826,19 @@ std::vector<ContactPoint> manifold(const Geometry &a, const Geometry &b, Separat
             }
         out.push_back({point, s.distance});
     }
-    std::sort(out.begin(), out.end(), [](const auto &x, const auto &y) {
-        return std::tie(x.point.x, x.point.y, x.point.z, x.separation) <
-               std::tie(y.point.x, y.point.y, y.point.z, y.separation);
-    });
-    // Approximate equality is not transitive, so it is not a valid equivalence
-    // predicate for std::unique. Specify the reduction order explicitly.
-    std::vector<ContactPoint> distinct;
-    for (const auto &point : out) {
-        bool duplicate = false;
-        for (const auto &chosen : distinct)
-            if (length(point.point - chosen.point) < 0.0001_r) {
-                duplicate = true;
-                break;
-            }
-        if (!duplicate)
-            distinct.push_back(point);
-    }
-    out = std::move(distinct);
-    if (out.size() > 4) {
-        // Deepest point, then maximum distance from the chosen set. Ties retain
-        // lexicographic order. This keeps the contact patch spatially distributed.
-        std::vector<ContactPoint> reduced;
-        auto deepest = std::min_element(
-            out.begin(), out.end(), [](const auto &x, const auto &y) { return x.separation < y.separation; });
-        reduced.push_back(*deepest);
-        out.erase(deepest);
-        while (reduced.size() < 4) {
-            std::size_t best = 0;
-            Real distance = -1_r;
-            for (std::size_t i = 0; i < out.size(); ++i) {
-                Real minimum_distance = Real::max();
-                for (const auto &selected : reduced)
-                    minimum_distance = (std::min)(minimum_distance, length(out[i].point - selected.point));
-                if (minimum_distance > distance) {
-                    distance = minimum_distance;
-                    best = i;
-                }
-            }
-            reduced.push_back(out[best]);
-            out.erase(out.begin() + static_cast<std::ptrdiff_t>(best));
-        }
-        out = std::move(reduced);
-    }
+    finish_manifold(out);
     return out;
 }
 Geometry translated(Geometry g, Vec3 delta) {
+    if (g.box) {
+        // Saturation destroys the parallelepiped: use its actual vertices with
+        // the generic path instead of applying an invalid analytic radius.
+        for (const auto vertex : g.vertices)
+            for (unsigned i = 0; i < 3; ++i)
+                if ((delta[i] > 0 && vertex[i] > Real::max() - delta[i]) ||
+                    (delta[i] < 0 && vertex[i] < Real::min() - delta[i]))
+                    g.box = false;
+    }
     g.a += delta;
     g.b += delta;
     g.center += delta;

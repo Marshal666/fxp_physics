@@ -5,14 +5,21 @@ import argparse
 import csv
 from pathlib import Path
 
-KEY = ("scene", "bodies", "ticks", "warmup", "queries", "sample")
+# Deliberately exclude workers: every worker count must produce identical states.
+KEY = (
+    "scene", "bodies", "hz", "substeps", "iterations", "phase",
+    "ticks", "warmup", "queries", "sample",
+)
 STATE = (
     "peak_pairs",
     "peak_contacts",
     "peak_awake",
+    "start_awake",
+    "end_awake",
     "checksum",
     "query_checksum",
     "query_hits",
+    "trace_checksum",
 )
 
 
@@ -20,7 +27,7 @@ def read_results(path):
     rows = {}
     with path.open(newline="", encoding="utf-8-sig") as stream:
         reader = csv.DictReader(stream)
-        missing = set(KEY + STATE) - set(reader.fieldnames or ())
+        missing = set(KEY + STATE + ("workers",)) - set(reader.fieldnames or ())
         if missing:
             raise ValueError(f"{path}: missing columns {sorted(missing)}")
         for row in reader:
@@ -36,7 +43,7 @@ def read_results(path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path, help="directory containing downloaded CSV artifacts")
-    parser.add_argument("--expected-files", type=int, default=8)
+    parser.add_argument("--expected-files", type=int, default=16)
     args = parser.parse_args()
     paths = sorted(args.directory.rglob("*.csv"))
     if len(paths) != args.expected_files or len(paths) < 2:
@@ -54,7 +61,8 @@ def main():
                                          f"{paths[0]} has {want}")
     except (OSError, ValueError, TypeError) as error:
         parser.error(str(error))
-    print(f"{len(paths)} platform/backend results matched {len(baseline)} scenario/sample rows exactly.")
+    print(f"{len(paths)} platform/backend/worker results matched "
+          f"{len(baseline)} scenario/sample rows exactly.")
 
 
 if __name__ == "__main__":

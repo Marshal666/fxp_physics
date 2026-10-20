@@ -4,7 +4,9 @@
 namespace fxp_physics {
 using namespace detail;
 namespace {
-constexpr std::uint32_t format_version = 1;
+// Version 2 changes solver rounding and box contact generation. Reject old
+// simulations explicitly even though their field layout was the same.
+constexpr std::uint32_t format_version = 2;
 constexpr std::uint64_t math_version = UINT64_C(0xf18e16b2f6c404da);
 constexpr std::size_t max_save_bytes = 256u * 1024u * 1024u;
 std::uint64_t hash_bytes(const Bytes &bytes, std::size_t count) {
@@ -405,6 +407,7 @@ void World::load(const Bytes &bytes) {
         require(r.u8() == c, "invalid save magic");
     require(r.u32() == format_version && r.u64() == math_version, "incompatible simulation/save version");
     auto next = std::make_unique<Impl>(read_config(r), 0);
+    next->requested_worker_count = impl_->requested_worker_count;
     auto &s = *next;
     s.tick = r.u64();
     s.rng.restore(r.u64());

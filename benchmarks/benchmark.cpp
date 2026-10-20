@@ -16,8 +16,9 @@ using namespace fxp_physics;
 using Clock = std::chrono::steady_clock;
 
 struct Options {
-    std::string scene = "playground", suite, trace, reference;
+    std::string scene = "playground", suite, trace, reference, phase = "awake";
     unsigned bodies = 1000, ticks = 240, samples = 3, warmup = 0, queries = 0;
+    unsigned hz = 60, substeps = 4, iterations = 12, workers = 0;
 };
 
 unsigned number(const std::string &text, const std::string &option) {
@@ -31,24 +32,32 @@ unsigned number(const std::string &text, const std::string &option) {
 
 Options options(int argc, char **argv) {
     Options o;
-    bool samples_set = false, bodies_set = false;
+    bool samples_set = false, bodies_set = false, warmup_set = false;
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
         if (arg == "--help") {
             std::cout <<
-                "fxp_physics_benchmark [--scene playground|kinematic|dynamic|stack]\n"
+                "fxp_physics_benchmark [--scene playground|kinematic|dynamic|stack|pile]\n"
                 "  --suite scaling  Run kinematic, dynamic and stack at 100, 500,\n"
                 "                   1000, 5000 and 10000 moving bodies\n"
-                "  --bodies N       Moving bodies (default 1000; stack default 128)\n"
+                "  --bodies N       Moving bodies (default 1000; stack/pile default 128)\n"
                 "  --ticks N        Measured ticks per sample (default 240)\n"
                 "  --samples N      Independently recreated worlds (default 3)\n"
                 "  --warmup N       Untimed initial ticks per sample (default 0)\n"
+                "  --phase NAME     awake, settled, or disturbed (default awake)\n"
+                "                   settled/disturbed default to 600 warmup ticks;\n"
+                "                   disturbed impulses one central bottom cube\n"
+                "  --hz N           Simulation ticks per second (default 60)\n"
+                "  --substeps N     Substeps per tick (default 4)\n"
+                "  --iterations N   Velocity solver iterations (default 12)\n"
+                "  --workers N      Worker count, 0 selects automatic (default 0)\n"
                 "  --queries N      Timed sphere overlaps after each tick (default 0)\n"
                 "  --trace FILE     Write per-tick state/query/event hashes; one sample\n"
                 "  --check-reference FILE  Require an exact frozen trace; one sample\n"
                 "CSV reports tick+query timings in microseconds. Setup, stats, hashes,\n"
                 "reference checking and trace I/O are outside the timed region.\n"
-                "All scenes use 60 Hz, four substeps and 12 solver iterations.\n";
+                "stack uses separated 8-box towers; pile uses touching 8-box towers.\n"
+                "Inspect start_awake/end_awake to confirm whether settling completed.\n";
             std::exit(0);
         }
         if (i + 1 == argc)
@@ -56,30 +65,44 @@ Options options(int argc, char **argv) {
         const std::string value = argv[++i];
         if (arg == "--scene") o.scene = value;
         else if (arg == "--suite") o.suite = value;
+        else if (arg == "--phase") o.phase = value;
         else if (arg == "--trace") o.trace = value;
         else if (arg == "--check-reference") o.reference = value;
         else if (arg == "--bodies") { o.bodies = number(value, arg); bodies_set = true; }
         else if (arg == "--ticks") o.ticks = number(value, arg);
         else if (arg == "--samples") { o.samples = number(value, arg); samples_set = true; }
-        else if (arg == "--warmup") o.warmup = number(value, arg);
+        else if (arg == "--warmup") { o.warmup = number(value, arg); warmup_set = true; }
         else if (arg == "--queries") o.queries = number(value, arg);
+        else if (arg == "--hz") o.hz = number(value, arg);
+        else if (arg == "--substeps") o.substeps = number(value, arg);
+        else if (arg == "--iterations") o.iterations = number(value, arg);
+        else if (arg == "--workers") o.workers = number(value, arg);
         else throw std::invalid_argument("unknown option " + arg);
     }
     if (o.scene != "playground" && o.scene != "kinematic" &&
-        o.scene != "dynamic" && o.scene != "stack")
+        o.scene != "dynamic" && o.scene != "stack" && o.scene != "pile")
         throw std::invalid_argument("unknown scene " + o.scene);
+    if (o.phase != "awake" && o.phase != "settled" && o.phase != "disturbed")
+        throw std::invalid_argument("unknown phase " + o.phase);
+    if (o.phase != "awake" && (o.scene != "stack" && o.scene != "pile"))
+        throw std::invalid_argument("settled/disturbed phases require --scene stack or pile");
+    if (o.phase != "awake" && !warmup_set) o.warmup = 600;
     if (!o.suite.empty() && o.suite != "scaling")
         throw std::invalid_argument("unknown suite " + o.suite);
     if (!o.suite.empty() && (bodies_set || o.scene != "playground" ||
                             !o.trace.empty() || !o.reference.empty()))
         throw std::invalid_argument("--suite scaling cannot combine with scene, bodies or trace options");
-    if (o.scene == "stack" && !bodies_set) o.bodies = 128;
+    if ((o.scene == "stack" || o.scene == "pile") && !bodies_set) o.bodies = 128;
     if (o.scene == "playground" && bodies_set)
         throw std::invalid_argument("playground has a fixed population; omit --bodies");
     if (!o.ticks || !o.samples || !o.bodies || o.bodies > 10000 ||
         o.ticks > 100000 || o.warmup > 100000 || o.samples > 1000 || o.queries > 10000)
         throw std::invalid_argument("expected bodies 1..10000, ticks 1..100000, samples 1..1000, "
                                     "warmup 0..100000, queries 0..10000");
+    if (o.hz < 10 || o.hz > 1000 || !o.substeps || o.substeps > 16 ||
+        !o.iterations || o.iterations > 64 || o.workers > 64)
+        throw std::invalid_argument("expected hz 10..1000, substeps 1..16, "
+                                    "iterations 1..64, workers 0..64");
     if (!o.trace.empty() || !o.reference.empty()) {
         if (samples_set && o.samples != 1)
             throw std::invalid_argument("traces require --samples 1");
@@ -105,12 +128,28 @@ BodyId add(World &w, const ShapePtr &shape, Vec3 position,
     return collider.body;
 }
 
-World playground() {
+Config configuration(const Options &o) {
     Config config;
-    config.timestep = 1_r / 60_r;
-    config.substeps = 4;
-    config.velocity_iterations = 12;
+    config.timestep = 1_r / Real(o.hz);
+    config.substeps = o.substeps;
+    config.velocity_iterations = o.iterations;
+    return config;
+}
+
+void configure_workers(World &world, unsigned workers) {
+#ifndef FXP_PHYSICS_BENCHMARK_LEGACY_WORKERS
+    world.set_worker_count(workers);
+#else
+    // Compile this benchmark against the pre-worker library for timing baselines.
+    (void)world;
+    if (workers > 1) throw std::invalid_argument("baseline library only supports one worker");
+#endif
+}
+
+World playground(const Options &o) {
+    auto config = configuration(o);
     World world(config, 1234);
+    configure_workers(world, o.workers);
     // Mirror examples/physics_playground.yaml, including viewer object IDs.
     // Every decimal is rounded once, exactly as the YAML decimal importer does.
     std::uint64_t object = 2; // Object 1 is the sun, with no physics body.
@@ -149,25 +188,30 @@ World playground() {
 }
 
 World scenario(const Options &o) {
-    if (o.scene == "playground") return playground();
-    Config config;
-    config.timestep = 1_r / 60_r;
-    config.substeps = 4;
-    config.velocity_iterations = 12;
-    if (o.scene != "stack") config.gravity = {};
+    if (o.scene == "playground") return playground(o);
+    auto config = configuration(o);
+    const bool boxes = o.scene == "stack" || o.scene == "pile";
+    if (!boxes) config.gravity = {};
     World world(config, 1234);
-    const auto shape = o.scene == "stack" ? Shape::box({0.5_r, 0.5_r, 0.5_r})
-                                         : Shape::sphere(0.4_r);
-    if (o.scene == "stack")
+    configure_workers(world, o.workers);
+    const auto shape = boxes ? Shape::box({0.5_r, 0.5_r, 0.5_r}) : Shape::sphere(0.4_r);
+    if (boxes)
         add(world, Shape::box({100, 0.5_r, 100}), {0, -0.5_r, 0}, BodyType::static_body);
+    unsigned pile_width = 1;
+    while (pile_width * pile_width < (o.bodies + 7) / 8) ++pile_width;
     for (unsigned i = 0; i < o.bodies; ++i) {
         BodyDesc body;
         body.type = o.scene == "kinematic" ? BodyType::kinematic : BodyType::dynamic;
-        if (o.scene == "stack") {
+        if (boxes) {
             const auto column = i / 8;
-            body.pose.position = {Real(column % 50) * 2 - 49,
-                                  Real(50 + 101 * (i % 8)) / 100,
-                                  Real(column / 50) * 2 - 49};
+            if (o.scene == "stack")
+                body.pose.position = {Real(column % 50) * 2 - 49,
+                                      Real(50 + 101 * (i % 8)) / 100,
+                                      Real(column / 50) * 2 - 49};
+            else
+                body.pose.position = {Real(column % pile_width) - Real(pile_width - 1) / 2,
+                                      Real(50 + 101 * (i % 8)) / 100,
+                                      Real(column / pile_width) - Real(pile_width - 1) / 2};
         } else {
             body.pose.position = {Real(i % 100) * 2, 0, Real(i / 100) * 2};
             body.linear_velocity = {0.5_r, 0, 0};
@@ -237,17 +281,26 @@ void benchmark(const Options &o, bool header = true) {
     }
     const auto probe = Shape::box({2, 2, 2});
     const auto timed_probe = Shape::sphere(0.4_r);
-    std::uint64_t expected_checksum = 0, expected_queries = 0;
+    std::uint64_t expected_checksum = 0, expected_queries = 0, expected_trace = 0;
     if (header)
-        std::cout << "scene,bodies,ticks,warmup,queries,sample,mean_us,p50_us,p95_us,max_us,"
-                     "peak_pairs,peak_contacts,peak_awake,checksum,query_checksum,query_hits\n";
+        std::cout << "scene,bodies,hz,substeps,iterations,workers,phase,ticks,warmup,queries,sample,"
+                     "mean_us,p50_us,p95_us,max_us,peak_pairs,peak_contacts,peak_awake,"
+                     "start_awake,end_awake,checksum,query_checksum,query_hits,trace_checksum\n";
     for (unsigned sample = 0; sample < o.samples; ++sample) {
         World world = scenario(o);
         for (unsigned tick = 0; tick < o.warmup; ++tick) world.step();
+        if (o.phase == "disturbed") {
+            // Creation order is ground followed by towers, bottom cube first.
+            const auto ids = world.body_ids();
+            const auto column = ((o.bodies + 7) / 8) / 2;
+            world.add_impulse(ids.at(1 + column * 8), {5, 0, 0});
+        }
+        const auto start_awake = world.stats().awake_dynamic_bodies;
         std::vector<double> times;
         times.reserve(o.ticks);
         std::uint32_t peak_pairs = 0, peak_contacts = 0, peak_awake = 0;
         std::uint64_t query_hits = 0;
+        Hash measured_trace;
         for (unsigned tick = 0; tick < o.ticks; ++tick) {
             const auto begin = Clock::now();
             world.step();
@@ -259,10 +312,17 @@ void benchmark(const Options &o, bool header = true) {
             peak_pairs = std::max(peak_pairs, stats.broadphase_pairs);
             peak_contacts = std::max(peak_contacts, stats.contacts);
             peak_awake = std::max(peak_awake, stats.awake_dynamic_bodies);
+            const auto state_hash = world.checksum();
+            const auto query_hash = queries(world, *probe);
+            const auto event_hash = events(world);
+            measured_trace.mix(world.tick());
+            measured_trace.mix(state_hash);
+            measured_trace.mix(query_hash);
+            measured_trace.mix(event_hash);
             if (!o.trace.empty() || !o.reference.empty()) {
                 std::ostringstream row;
-                row << o.scene << ',' << world.tick() << ',' << world.checksum() << ','
-                    << queries(world, *probe) << ',' << events(world);
+                row << o.scene << ',' << world.tick() << ',' << state_hash << ','
+                    << query_hash << ',' << event_hash;
                 if (!o.trace.empty()) trace << row.str() << '\n';
                 if (!o.reference.empty()) {
                     std::string expected;
@@ -273,18 +333,24 @@ void benchmark(const Options &o, bool header = true) {
             }
         }
         const auto checksum = world.checksum(), query_checksum = queries(world, *probe);
-        if (sample && (checksum != expected_checksum || query_checksum != expected_queries))
+        if (sample && (checksum != expected_checksum || query_checksum != expected_queries ||
+                       measured_trace.value != expected_trace))
             throw std::runtime_error("independent benchmark samples diverged");
         expected_checksum = checksum;
         expected_queries = query_checksum;
+        expected_trace = measured_trace.value;
         const auto mean = std::accumulate(times.begin(), times.end(), 0.0) / times.size();
         std::sort(times.begin(), times.end());
         const auto percentile = [&](unsigned p) { return times[(times.size() * p + 99) / 100 - 1]; };
-        std::cout << o.scene << ',' << world.stats().bodies << ',' << o.ticks << ',' << o.warmup
+        std::cout << o.scene << ',' << world.stats().bodies << ',' << o.hz << ',' << o.substeps
+                  << ',' << o.iterations << ',' << o.workers << ',' << o.phase
+                  << ',' << o.ticks << ',' << o.warmup
                   << ',' << o.queries << ',' << sample + 1 << ',' << std::fixed << std::setprecision(3)
                   << mean << ',' << percentile(50) << ',' << percentile(95) << ',' << times.back()
-                  << ',' << peak_pairs << ',' << peak_contacts << ',' << peak_awake << ','
-                  << checksum << ',' << query_checksum << ',' << query_hits << '\n';
+                  << ',' << peak_pairs << ',' << peak_contacts << ',' << peak_awake
+                  << ',' << start_awake << ',' << world.stats().awake_dynamic_bodies << ','
+                  << checksum << ',' << query_checksum << ',' << query_hits
+                  << ',' << measured_trace.value << '\n';
     }
     if (!o.reference.empty()) {
         std::string extra;

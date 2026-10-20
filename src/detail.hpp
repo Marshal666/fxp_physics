@@ -9,6 +9,7 @@
 
 namespace fxp_physics {
 namespace detail {
+struct SolverData;
 inline Real clamp(Real x, Real lo, Real hi) {
     return (std::max)(lo, (std::min)(x, hi));
 }
@@ -144,6 +145,8 @@ struct Tree {
 };
 struct Geometry {
     bool rounded = false;
+    bool box = false;
+    std::array<Vec3, 3> box_axes{}, box_half_axes{};
     Vec3 a{}, b{};
     Real radius{};
     std::vector<Vec3> vertices;
@@ -167,6 +170,7 @@ struct Separation {
     Real distance = Real::min();
     Vec3 normal{1, 0, 0};
     Vec3 point_a{}, point_b{};
+    std::int32_t box_axis = -1;
 };
 Separation separate(const Geometry &a, const Geometry &b, Real rejection_threshold = Real::max());
 std::vector<ContactPoint> manifold(const Geometry &a, const Geometry &b, Separation separation, Real margin);
@@ -240,6 +244,13 @@ struct World::Impl {
     std::vector<Contact> contacts;
     std::vector<Pair> pairs;
     std::vector<CollisionEvent> events;
+    // Transient exact-pose contact cache. Queries never update this history.
+    std::vector<Pose> contact_poses;
+    std::vector<Pair> contact_pairs;
+    std::shared_ptr<detail::SolverData> solver_data;
+    struct ContactData;
+    std::shared_ptr<ContactData> contact_data;
+    std::uint32_t requested_worker_count = 0;
     mutable bool dirty = true;
     mutable detail::Tree tree;
     mutable std::vector<Proxy> proxies;
@@ -267,9 +278,9 @@ struct World::Impl {
     }
     Vec3 angular_mass(const Body &b, Vec3 v) const;
     Vec3 point_velocity(const Body &b, Vec3 point) const;
-    void impulse(Body &b, Vec3 value, Vec3 point);
-    Real effective_mass(const Body &a, const Body *b, Vec3 pa, Vec3 pb, Vec3 axis) const;
     void find_contacts();
+    void parallel_for(std::size_t count, std::size_t work,
+                      std::function<void(std::size_t)> job);
     void solve(Real h);
     std::vector<std::size_t> islands() const;
     void propagate_waking();

@@ -11,7 +11,7 @@ jobs:
           - { os: windows-2022, compiler: cl, name: msvc-x64 }
           - { os: ubuntu-24.04, compiler: g++, name: gcc-x64 }
           - { os: ubuntu-24.04, compiler: clang++, name: clang-x64 }
-          - { os: macos-14, compiler: clang++, name: clang-arm64 }
+          - { os: macos-15, compiler: clang++, name: clang-arm64 }
         build_type: [Debug, Release]
         portable: ["OFF", "ON"]
     runs-on: ${{ matrix.platform.os }}
@@ -37,15 +37,18 @@ jobs:
       # Frozen traces are identical across compilers, architectures and backends.
       # Tests never regenerate either reference.
       - run: ctest --test-dir build/ci --output-on-failure
-      - name: Measure all requested populations
+      - uses: actions/setup-python@v7
         if: matrix.build_type == 'Release'
-        shell: bash
-        run: ./build/ci/fxp_physics_benchmark --suite scaling --ticks 10 --samples 2 > scaling.csv
+        with:
+          python-version: '3.13'
+      - name: Measure requested populations and compare worker schedules
+        if: matrix.build_type == 'Release'
+        run: python benchmarks/run_validation.py build/ci/fxp_physics_benchmark scaling-results
       - uses: actions/upload-artifact@v7
         if: matrix.build_type == 'Release'
         with:
           name: scaling-${{ matrix.platform.name }}-portable-${{ matrix.portable }}
-          path: scaling.csv
+          path: scaling-results/*.csv
           if-no-files-found: error
   compare_scaling:
     needs: test
@@ -56,8 +59,8 @@ jobs:
         with:
           pattern: scaling-*
           path: scaling-results
-      - name: Compare all large-scene states across platforms
-        run: python3 benchmarks/compare_results.py scaling-results --expected-files 8
+      - name: Compare every measured tick across platforms, backends and worker counts
+        run: python3 benchmarks/compare_results.py scaling-results --expected-files 16
   sanitizers:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -72,3 +75,21 @@ jobs:
           -DFXP_BUILD_TESTS=ON -DFXP_PORTABLE_ONLY=ON -DFXP_DISABLE_SSE2=ON
       - run: cmake --build build/sanitize --parallel 3
       - run: ctest --test-dir build/sanitize --output-on-failure
+  thread_sanitizer:
+    # Ubuntu 22.04 avoids the wider ASLR layout that conflicts with older TSan runtimes.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - run: >-
+          cmake -S . -B build/tsan -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=g++
+          -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -g"
+          -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=thread
+          -DFXP_PORTABLE_ONLY=ON -DFXP_DISABLE_SSE2=ON
+          -DFXP_PHYSICS_BUILD_TESTS=ON
+      - run: cmake --build build/tsan --parallel 3
+      - name: Check solver workers and contact-cache wake paths for races
+        run: ctest --test-dir build/tsan --output-on-failure --no-tests=error -R "solver|contact_cache"

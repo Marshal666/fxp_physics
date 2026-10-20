@@ -208,6 +208,8 @@ void World::Impl::wake_connected(BodyId id) {
         }
 }
 void World::Impl::invalidate(BodyId id) {
+    contact_poses.clear();
+    contact_pairs.clear();
     contacts.erase(std::remove_if(contacts.begin(), contacts.end(),
                                   [&](const auto &c) {
                                       return colliders[collider_index(c.a)].desc.body == id ||
@@ -287,6 +289,8 @@ SpringId World::create_spring(const SpringDesc &d) {
             "invalid spring");
     const auto id = next_id(w.next_spring, w.springs);
     w.springs.push_back({id, d, 0});
+    w.contact_poses.clear();
+    w.contact_pairs.clear();
     w.wake_connected(d.body_a);
     if (d.body_b)
         w.wake_connected(d.body_b);
@@ -341,6 +345,8 @@ void World::remove_spring(SpringId id) {
     if (w.springs[i].desc.body_b)
         w.wake_connected(w.springs[i].desc.body_b);
     w.springs.erase(w.springs.begin() + static_cast<std::ptrdiff_t>(i));
+    w.contact_poses.clear();
+    w.contact_pairs.clear();
 }
 BodyState World::body(BodyId id) const {
     const auto &b = impl_->get(id);
@@ -517,6 +523,8 @@ void World::set_layer_collision(std::uint8_t a, std::uint8_t b, bool enabled) {
         w.layers[b] &= ~(std::uint32_t(1) << a);
     }
     w.contacts.clear();
+    w.contact_poses.clear();
+    w.contact_pairs.clear();
     w.wake_all();
 }
 bool World::layer_collision(std::uint8_t a, std::uint8_t b) const {
@@ -547,140 +555,6 @@ Vec3 World::Impl::point_velocity(const Body &b, Vec3 point) const {
         return b.desc.linear_velocity;
     return b.desc.linear_velocity + cross(b.desc.angular_velocity, point - com(b));
 }
-void World::Impl::impulse(Body &b, Vec3 value, Vec3 point) {
-    if (immovable(b.desc.type) || b.sleeping || zero(value))
-        return;
-    b.desc.linear_velocity += value * b.inverse_mass;
-    b.desc.angular_velocity += angular_mass(b, cross(point - com(b), value));
-}
-Real World::Impl::effective_mass(const Body &a, const Body *b, Vec3 pa, Vec3 pb, Vec3 axis) const {
-    const Vec3 ra = pa - com(a);
-    Real k = a.inverse_mass + dot(cross(angular_mass(a, cross(ra, axis)), ra), axis);
-    if (b) {
-        const Vec3 rb = pb - com(*b);
-        k += b->inverse_mass + dot(cross(angular_mass(*b, cross(rb, axis)), rb), axis);
-    }
-    return (std::max)(k, 0_r);
-}
-
-void World::Impl::find_contacts() {
-    rebuild();
-    auto previous = std::move(contacts);
-    contacts.clear();
-    pairs.clear();
-    stats.broadphase_pairs = 0;
-    std::vector<bool> matched(previous.size(), false);
-    // Retain convex geometry until its exact world pose changes. Static and
-    // sleeping colliders can reuse it across substeps and completed ticks.
-    const auto geometry_for = [&](std::size_t index, std::uint32_t triangle, Geometry &temporary) -> const Geometry & {
-        const auto &shape = colliders[index].desc.shape->data();
-        if (concave(shape.type)) {
-            temporary = geometry(shape, proxies[index].pose, triangle);
-            return temporary;
-        }
-        auto &cooked = proxies[index].geometry;
-        if (!cooked)
-            cooked = geometry(shape, proxies[index].pose, triangle);
-        return *cooked;
-    };
-    std::vector<std::pair<BodyId, BodyId>> excluded;
-    for (const auto &s : springs)
-        if (!s.desc.collide_connected && s.desc.body_b)
-            excluded.emplace_back((std::min)(s.desc.body_a, s.desc.body_b),
-                                  (std::max)(s.desc.body_a, s.desc.body_b));
-    std::sort(excluded.begin(), excluded.end());
-    std::vector<std::uint32_t> candidates;
-    for (std::size_t i = 0; i < colliders.size(); ++i) {
-        const auto &ca = colliders[i];
-        const auto &pa = proxies[i];
-        const auto &ba = bodies[pa.body];
-        tree.query(pa.bounds.expanded(config.contact_margin), candidates);
-        for (const auto j : candidates) {
-            if (j <= i)
-                continue;
-            const auto &cb = colliders[j];
-            const auto &pb = proxies[j];
-            const auto &bb = bodies[pb.body];
-            if (ca.desc.body == cb.desc.body ||
-                (ba.desc.type == BodyType::static_body && bb.desc.type == BodyType::static_body))
-                continue;
-            if (!(layers[ca.desc.layer] & (std::uint32_t(1) << cb.desc.layer)))
-                continue;
-            if (std::binary_search(excluded.begin(), excluded.end(),
-                                   std::make_pair((std::min)(ba.id, bb.id), (std::max)(ba.id, bb.id))))
-                continue;
-            ++stats.broadphase_pairs;
-            const auto ta =
-                triangles(ca.desc.shape->data(), pa.pose, pb.bounds.expanded(config.contact_margin));
-            const auto tb =
-                triangles(cb.desc.shape->data(), pb.pose, pa.bounds.expanded(config.contact_margin));
-            bool paired = false;
-            for (auto ai : ta)
-                for (auto bi : tb) {
-                    Geometry temporary_a, temporary_b;
-                    const auto &ga = geometry_for(i, ai, temporary_a);
-                    const auto &gb = geometry_for(j, bi, temporary_b);
-                    const bool sensor = ca.desc.sensor || cb.desc.sensor;
-                    const Real margin = sensor ? 0_r : config.contact_margin;
-                    const auto sep = separate(ga, gb, margin);
-                    if (sep.distance > margin)
-                        continue;
-                    const auto points = manifold(ga, gb, sep, config.contact_margin);
-                    if (!paired) {
-                        pairs.push_back(
-                            {ca.id, cb.id, ba.id, bb.id, sensor, points.front().point, sep.normal});
-                        paired = true;
-                    }
-                    if (sensor || (immovable(ba.desc.type) && immovable(bb.desc.type)))
-                        continue;
-                    for (const auto &point : points) {
-                        Contact c;
-                        c.a = ca.id;
-                        c.b = cb.id;
-                        c.triangle_a = ai;
-                        c.triangle_b = bi;
-                        c.normal = sep.normal;
-                        c.separation = point.separation;
-                        c.local_a = untransform(ba.desc.pose, point.point);
-                        c.local_b = untransform(bb.desc.pose, point.point);
-                        const Real speed =
-                            dot(point_velocity(bb, point.point) - point_velocity(ba, point.point), c.normal);
-                        const Real restitution =
-                            (std::max)(ca.desc.material.restitution, cb.desc.material.restitution);
-                        c.bounce = speed < -config.restitution_threshold ? -speed * restitution : 0_r;
-                        Real nearest = 0.03_r;
-                        const auto begin =
-                            std::lower_bound(previous.begin(), previous.end(), std::make_pair(c.a, c.b),
-                                             [](const Contact &old, const auto &key) {
-                                                 return std::make_pair(old.a, old.b) < key;
-                                             });
-                        std::size_t selected = previous.size();
-                        for (auto it = begin; it != previous.end() && it->a == c.a && it->b == c.b; ++it) {
-                            const auto k = static_cast<std::size_t>(it - previous.begin());
-                            if (matched[k] || it->triangle_a != ai || it->triangle_b != bi ||
-                                dot(it->normal, c.normal) < 0.95_r)
-                                continue;
-                            const Real distance =
-                                length(it->local_a - c.local_a) + length(it->local_b - c.local_b);
-                            if (distance < nearest) {
-                                nearest = distance;
-                                selected = k;
-                            }
-                        }
-                        if (selected != previous.size()) {
-                            matched[selected] = true;
-                            c.normal_impulse = previous[selected].normal_impulse;
-                            c.tangent_impulse = previous[selected].tangent_impulse -
-                                                c.normal * dot(previous[selected].tangent_impulse, c.normal);
-                        }
-                        contacts.push_back(c);
-                    }
-                }
-        }
-    }
-    stats.contacts = static_cast<std::uint32_t>(contacts.size());
-}
-
 std::vector<std::size_t> World::Impl::islands() const {
     std::vector<std::size_t> parent(bodies.size());
     std::iota(parent.begin(), parent.end(), std::size_t(0));
@@ -709,6 +583,12 @@ std::vector<std::size_t> World::Impl::islands() const {
     return parent;
 }
 void World::Impl::propagate_waking() {
+    if (std::none_of(bodies.begin(), bodies.end(), [](const Body &b) {
+            return (b.desc.type == BodyType::dynamic && !b.sleeping) ||
+                   (b.desc.type == BodyType::kinematic &&
+                    (!zero(b.desc.linear_velocity) || !zero(b.desc.angular_velocity)));
+        }))
+        return;
     const auto roots = islands();
     std::vector<bool> active(bodies.size(), false);
     for (std::size_t i = 0; i < bodies.size(); ++i)
@@ -740,111 +620,11 @@ void World::Impl::propagate_waking() {
             bodies[i].quiet_ticks = 0;
         }
 }
-void World::Impl::solve(Real h) {
-    struct Row {
-        std::size_t a, b;
-        Vec3 point, normal, t1, t2;
-        Real kn, kt1, kt2, bias, mu_static, mu_dynamic;
-    };
-    std::vector<Row> rows;
-    rows.reserve(contacts.size());
-    for (auto &c : contacts) {
-        const auto &ca = colliders[collider_index(c.a)];
-        const auto &cb = colliders[collider_index(c.b)];
-        const auto ia = body_index(ca.desc.body), ib = body_index(cb.desc.body);
-        auto &a = bodies[ia];
-        auto &b = bodies[ib];
-        const Vec3 point = (transform(a.desc.pose, c.local_a) + transform(b.desc.pose, c.local_b)) / 2_r;
-        const Vec3 n = c.normal, an = abs(n);
-        Vec3 basis{1, 0, 0};
-        if (an.y < an.x && an.y <= an.z)
-            basis = {0, 1, 0};
-        else if (an.z < an.x && an.z < an.y)
-            basis = {0, 0, 1};
-        const Vec3 t1 = unit(cross(n, basis)), t2 = cross(n, t1);
-        const Real bias =
-            c.separation > 0
-                ? -c.separation / h
-                : (std::min)(config.max_correction_speed,
-                             config.stabilization * (std::max)(-c.separation - config.contact_slop, 0_r) / h);
-        rows.push_back({ia, ib, point, n, t1, t2, effective_mass(a, &b, point, point, n),
-                        effective_mass(a, &b, point, point, t1), effective_mass(a, &b, point, point, t2),
-                        c.bounce > 0 ? (std::max)(bias, c.bounce) : bias,
-                        fxp::sqrt(ca.desc.material.static_friction * cb.desc.material.static_friction),
-                        fxp::sqrt(ca.desc.material.dynamic_friction * cb.desc.material.dynamic_friction)});
-        const Vec3 warm = n * c.normal_impulse + c.tangent_impulse;
-        impulse(a, -warm, point);
-        impulse(b, warm, point);
-    }
-    struct SpringRow {
-        std::size_t a, b;
-        Vec3 pa, pb, n;
-        Real k, gamma, bias, max;
-    };
-    std::vector<SpringRow> spring_rows;
-    for (auto &s : springs) {
-        const auto a = body_index(s.desc.body_a),
-                   b = s.desc.body_b ? body_index(s.desc.body_b) : bodies.size();
-        const Vec3 pa = transform(bodies[a].desc.pose, s.desc.anchor_a),
-                   pb = s.desc.body_b ? transform(bodies[b].desc.pose, s.desc.anchor_b) : s.desc.anchor_b;
-        const Vec3 n = unit(pb - pa);
-        const Real k = effective_mass(bodies[a], b == bodies.size() ? nullptr : &bodies[b], pa, pb, n);
-        const Real omega = 2_r * fxp::pi_v<Real> * s.desc.frequency;
-        const Real term = 2_r * s.desc.damping_ratio * omega + h * omega * omega;
-        const Real gamma = k / (h * term),
-                   bias = (length(pb - pa) - s.desc.rest_length) * omega * omega / term;
-        const Real max = s.desc.max_force * h;
-        s.impulse = clamp(s.impulse, -max, max);
-        spring_rows.push_back({a, b, pa, pb, n, k, gamma, bias, max});
-        impulse(bodies[a], -n * s.impulse, pa);
-        if (b != bodies.size())
-            impulse(bodies[b], n * s.impulse, pb);
-    }
-    for (std::uint32_t iteration = 0; iteration < config.velocity_iterations; ++iteration) {
-        for (std::size_t i = 0; i < contacts.size(); ++i) {
-            auto &c = contacts[i];
-            const auto &r = rows[i];
-            auto &a = bodies[r.a];
-            auto &b = bodies[r.b];
-            if (r.kn <= 0 ||
-                ((a.sleeping || immovable(a.desc.type)) && (b.sleeping || immovable(b.desc.type))))
-                continue;
-            const Real vn = dot(point_velocity(b, r.point) - point_velocity(a, r.point), r.normal);
-            const Real accumulated = (std::max)(0_r, c.normal_impulse + (r.bias - vn) / r.kn);
-            const Vec3 normal_impulse = r.normal * (accumulated - c.normal_impulse);
-            c.normal_impulse = accumulated;
-            impulse(a, -normal_impulse, r.point);
-            impulse(b, normal_impulse, r.point);
-            const Vec3 velocity = point_velocity(b, r.point) - point_velocity(a, r.point);
-            const Real t1 = dot(c.tangent_impulse, r.t1) - (r.kt1 > 0 ? dot(velocity, r.t1) / r.kt1 : 0_r);
-            const Real t2 = dot(c.tangent_impulse, r.t2) - (r.kt2 > 0 ? dot(velocity, r.t2) / r.kt2 : 0_r);
-            Vec3 tangent = r.t1 * t1 + r.t2 * t2;
-            if (length_greater_than(tangent, r.mu_static * accumulated))
-                tangent = limit(tangent, r.mu_dynamic * accumulated);
-            const Vec3 change = tangent - c.tangent_impulse;
-            c.tangent_impulse = tangent;
-            impulse(a, -change, r.point);
-            impulse(b, change, r.point);
-        }
-        for (std::size_t i = 0; i < springs.size(); ++i) {
-            auto &s = springs[i];
-            const auto &r = spring_rows[i];
-            if (r.k <= 0)
-                continue;
-            const Vec3 va = point_velocity(bodies[r.a], r.pa),
-                       vb = r.b == bodies.size() ? Vec3{} : point_velocity(bodies[r.b], r.pb);
-            const Real next =
-                clamp(s.impulse - (dot(vb - va, r.n) + r.bias + r.gamma * s.impulse) / (r.k + r.gamma),
-                      -r.max, r.max);
-            const Vec3 value = r.n * (next - s.impulse);
-            s.impulse = next;
-            impulse(bodies[r.a], -value, r.pa);
-            if (r.b != bodies.size())
-                impulse(bodies[r.b], value, r.pb);
-        }
-    }
-}
 void World::Impl::sleep_islands() {
+    if (std::none_of(bodies.begin(), bodies.end(), [](const Body &b) {
+            return b.desc.type == BodyType::dynamic && !b.sleeping;
+        }))
+        return;
     const auto roots = islands();
     std::vector<bool> quiet(bodies.size(), true);
     std::vector<std::uint32_t> counters(bodies.size(), config.sleep_ticks);
@@ -957,17 +737,19 @@ void World::step(const std::function<void(World &)> &fixed_update) {
             }
             b.desc.linear_velocity = limit(b.desc.linear_velocity, w.config.max_linear_speed);
             b.desc.angular_velocity = limit(b.desc.angular_velocity, w.config.max_angular_speed);
-            if (b.desc.type == BodyType::kinematic && b.has_target)
+            if (b.desc.type == BodyType::kinematic && b.has_target) {
                 b.desc.pose = interpolate(b.previous, b.target, Real(substep + 1) / Real(w.config.substeps));
-            else if (b.desc.type == BodyType::kinematic) {
+                w.dirty = true;
+            } else if (b.desc.type == BodyType::kinematic &&
+                       (!zero(b.desc.linear_velocity) || !zero(b.desc.angular_velocity))) {
                 const Vec3 center = w.com(b) + b.desc.linear_velocity * h;
                 b.desc.pose.rotation = advance_rotation(b.desc.pose.rotation, b.desc.angular_velocity, h);
                 b.desc.pose.position = zero(b.desc.center_of_mass)
                                            ? center : center - b.desc.pose.rotation.rotate(b.desc.center_of_mass);
+                w.dirty = true;
             }
             validate_vec(b.desc.pose.position, 8192, "body left supported world range");
         }
-        w.dirty = true;
         w.find_contacts();
         w.propagate_waking();
         w.solve(h);
