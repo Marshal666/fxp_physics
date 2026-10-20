@@ -12,6 +12,10 @@ bool concave(ShapeType type) {
     return type == ShapeType::mesh || type == ShapeType::heightfield;
 }
 template <class Container> std::size_t index_of(const Container &values, std::uint64_t id) {
+    // IDs are dense until removal. Keep the common lookup constant time, while
+    // retaining ordered lookup for sparse IDs and loaded worlds.
+    if (id && id <= values.size() && values[static_cast<std::size_t>(id - 1)].id == id)
+        return static_cast<std::size_t>(id - 1);
     const auto it = std::lower_bound(values.begin(), values.end(), id,
                                      [](const auto &item, auto key) { return item.id < key; });
     if (it == values.end() || it->id != id)
@@ -82,18 +86,38 @@ Pose World::Impl::local_pose(const Collider &collider) const {
 void World::Impl::rebuild() const {
     if (!dirty)
         return;
-    proxies.clear();
-    proxies.reserve(colliders.size());
-    std::vector<Bounds> boxes;
-    boxes.reserve(colliders.size());
-    for (const auto &c : colliders) {
+    bool topology_changed = proxies.size() != colliders.size();
+    bool bounds_changed = topology_changed;
+    proxies.resize(colliders.size());
+    proxy_bounds.resize(colliders.size());
+    for (std::size_t i = 0; i < colliders.size(); ++i) {
+        const auto &c = colliders[i];
+        auto &proxy = proxies[i];
         const auto b = body_index(c.desc.body);
         const auto pose = compose(bodies[b].desc.pose, local_pose(c));
-        const auto box = bounds(c.desc.shape->data(), pose);
-        proxies.push_back({pose, box, b});
-        boxes.push_back(box);
+        const bool new_collider = proxy.collider != c.id;
+        topology_changed |= new_collider;
+        if (new_collider || proxy.pose.position != pose.position ||
+            proxy.pose.rotation.get_internal_vector() != pose.rotation.get_internal_vector()) {
+            proxy.collider = c.id;
+            proxy.pose = pose;
+            proxy.bounds = bounds(c.desc.shape->data(), pose);
+            proxy.geometry.reset();
+            bounds_changed = true;
+        }
+        // Body indices may change even when this collider's pose does not.
+        proxy.body = b;
+        proxy_bounds[i] = proxy.bounds;
     }
-    tree.build(boxes);
+    if (topology_changed || (bounds_changed && tree_refits >= 32)) {
+        tree.build(proxy_bounds);
+        tree_refits = 0;
+    } else if (bounds_changed) {
+        // Refit preserves all leaf bounds; query results are always ID-sorted,
+        // so topology and query frequency cannot affect contact order/results.
+        tree.refit(proxy_bounds);
+        ++tree_refits;
+    }
     dirty = false;
 }
 void World::Impl::recalculate_inertia(BodyId id) {
@@ -505,9 +529,10 @@ void World::wake(BodyId id) {
 }
 
 Vec3 World::Impl::angular_mass(const Body &b, Vec3 v) const {
-    if (immovable(b.desc.type))
+    if (immovable(b.desc.type) || zero(v) || b.desc.rotation_locks == 7)
         return {};
-    Vec3 local = inverse(b.desc.pose.rotation).rotate(v);
+    b.rotation.set(b.desc.pose.rotation);
+    Vec3 local = b.rotation.rotate(v, true);
     for (unsigned i = 0; i < 3; ++i)
         if (b.desc.rotation_locks & (1u << i))
             local[i] = 0;
@@ -515,13 +540,15 @@ Vec3 World::Impl::angular_mass(const Body &b, Vec3 v) const {
     for (unsigned i = 0; i < 3; ++i)
         if (b.desc.rotation_locks & (1u << i))
             local[i] = 0;
-    return b.desc.pose.rotation.rotate(local);
+    return b.rotation.rotate(local);
 }
 Vec3 World::Impl::point_velocity(const Body &b, Vec3 point) const {
+    if (zero(b.desc.angular_velocity))
+        return b.desc.linear_velocity;
     return b.desc.linear_velocity + cross(b.desc.angular_velocity, point - com(b));
 }
 void World::Impl::impulse(Body &b, Vec3 value, Vec3 point) {
-    if (immovable(b.desc.type) || b.sleeping)
+    if (immovable(b.desc.type) || b.sleeping || zero(value))
         return;
     b.desc.linear_velocity += value * b.inverse_mass;
     b.desc.angular_velocity += angular_mass(b, cross(point - com(b), value));
@@ -543,18 +570,18 @@ void World::Impl::find_contacts() {
     pairs.clear();
     stats.broadphase_pairs = 0;
     std::vector<bool> matched(previous.size(), false);
-    // Collider poses are immutable during contact discovery. Reuse each convex
-    // collider's transformed vertices/normals across all of its candidate pairs.
-    std::vector<std::optional<Geometry>> cooked(colliders.size());
+    // Retain convex geometry until its exact world pose changes. Static and
+    // sleeping colliders can reuse it across substeps and completed ticks.
     const auto geometry_for = [&](std::size_t index, std::uint32_t triangle, Geometry &temporary) -> const Geometry & {
         const auto &shape = colliders[index].desc.shape->data();
         if (concave(shape.type)) {
             temporary = geometry(shape, proxies[index].pose, triangle);
             return temporary;
         }
-        if (!cooked[index])
-            cooked[index] = geometry(shape, proxies[index].pose, triangle);
-        return *cooked[index];
+        auto &cooked = proxies[index].geometry;
+        if (!cooked)
+            cooked = geometry(shape, proxies[index].pose, triangle);
+        return *cooked;
     };
     std::vector<std::pair<BodyId, BodyId>> excluded;
     for (const auto &s : springs)
@@ -562,11 +589,13 @@ void World::Impl::find_contacts() {
             excluded.emplace_back((std::min)(s.desc.body_a, s.desc.body_b),
                                   (std::max)(s.desc.body_a, s.desc.body_b));
     std::sort(excluded.begin(), excluded.end());
+    std::vector<std::uint32_t> candidates;
     for (std::size_t i = 0; i < colliders.size(); ++i) {
         const auto &ca = colliders[i];
         const auto &pa = proxies[i];
         const auto &ba = bodies[pa.body];
-        for (const auto j : tree.query(pa.bounds.expanded(config.contact_margin))) {
+        tree.query(pa.bounds.expanded(config.contact_margin), candidates);
+        for (const auto j : candidates) {
             if (j <= i)
                 continue;
             const auto &cb = colliders[j];
@@ -591,9 +620,10 @@ void World::Impl::find_contacts() {
                     Geometry temporary_a, temporary_b;
                     const auto &ga = geometry_for(i, ai, temporary_a);
                     const auto &gb = geometry_for(j, bi, temporary_b);
-                    const auto sep = separate(ga, gb);
                     const bool sensor = ca.desc.sensor || cb.desc.sensor;
-                    if (sep.distance > (sensor ? 0_r : config.contact_margin))
+                    const Real margin = sensor ? 0_r : config.contact_margin;
+                    const auto sep = separate(ga, gb, margin);
+                    if (sep.distance > margin)
                         continue;
                     const auto points = manifold(ga, gb, sep, config.contact_margin);
                     if (!paired) {
@@ -655,8 +685,10 @@ std::vector<std::size_t> World::Impl::islands() const {
     std::vector<std::size_t> parent(bodies.size());
     std::iota(parent.begin(), parent.end(), std::size_t(0));
     const auto root = [&](std::size_t i) {
-        while (parent[i] != i)
+        while (parent[i] != i) {
+            parent[i] = parent[parent[i]];
             i = parent[i];
+        }
         return i;
     };
     const auto join = [&](BodyId aid, BodyId bid) {
@@ -787,7 +819,7 @@ void World::Impl::solve(Real h) {
             const Real t1 = dot(c.tangent_impulse, r.t1) - (r.kt1 > 0 ? dot(velocity, r.t1) / r.kt1 : 0_r);
             const Real t2 = dot(c.tangent_impulse, r.t2) - (r.kt2 > 0 ? dot(velocity, r.t2) / r.kt2 : 0_r);
             Vec3 tangent = r.t1 * t1 + r.t2 * t2;
-            if (length(tangent) > r.mu_static * accumulated)
+            if (length_greater_than(tangent, r.mu_static * accumulated))
                 tangent = limit(tangent, r.mu_dynamic * accumulated);
             const Vec3 change = tangent - c.tangent_impulse;
             c.tangent_impulse = tangent;
@@ -832,8 +864,9 @@ void World::Impl::sleep_islands() {
         const auto &b = bodies[i];
         if (immovable(b.desc.type))
             continue;
-        if (!b.desc.allow_sleep || length(b.desc.linear_velocity) > config.sleep_linear_speed ||
-            length(b.desc.angular_velocity) > config.sleep_angular_speed || !zero(b.force) || !zero(b.torque))
+        if (!b.desc.allow_sleep || length_greater_than(b.desc.linear_velocity, config.sleep_linear_speed) ||
+            length_greater_than(b.desc.angular_velocity, config.sleep_angular_speed) ||
+            !zero(b.force) || !zero(b.torque))
             quiet[roots[i]] = false;
         counters[roots[i]] = (std::min)(counters[roots[i]], b.quiet_ticks);
     }
@@ -914,11 +947,13 @@ void World::step(const std::function<void(World &)> &fixed_update) {
                 b.desc.angular_velocity += w.angular_mass(b, b.torque) * h;
                 b.desc.linear_velocity = b.desc.linear_velocity / (1_r + b.desc.linear_damping * h);
                 b.desc.angular_velocity = b.desc.angular_velocity / (1_r + b.desc.angular_damping * h);
-                Vec3 local = inverse(b.desc.pose.rotation).rotate(b.desc.angular_velocity);
-                for (unsigned i = 0; i < 3; ++i)
-                    if (b.desc.rotation_locks & (1u << i))
-                        local[i] = 0;
-                b.desc.angular_velocity = b.desc.pose.rotation.rotate(local);
+                if (!zero(b.desc.angular_velocity)) {
+                    Vec3 local = inverse(b.desc.pose.rotation).rotate(b.desc.angular_velocity);
+                    for (unsigned i = 0; i < 3; ++i)
+                        if (b.desc.rotation_locks & (1u << i))
+                            local[i] = 0;
+                    b.desc.angular_velocity = b.desc.pose.rotation.rotate(local);
+                }
             }
             b.desc.linear_velocity = limit(b.desc.linear_velocity, w.config.max_linear_speed);
             b.desc.angular_velocity = limit(b.desc.angular_velocity, w.config.max_angular_speed);
@@ -927,7 +962,8 @@ void World::step(const std::function<void(World &)> &fixed_update) {
             else if (b.desc.type == BodyType::kinematic) {
                 const Vec3 center = w.com(b) + b.desc.linear_velocity * h;
                 b.desc.pose.rotation = advance_rotation(b.desc.pose.rotation, b.desc.angular_velocity, h);
-                b.desc.pose.position = center - b.desc.pose.rotation.rotate(b.desc.center_of_mass);
+                b.desc.pose.position = zero(b.desc.center_of_mass)
+                                           ? center : center - b.desc.pose.rotation.rotate(b.desc.center_of_mass);
             }
             validate_vec(b.desc.pose.position, 8192, "body left supported world range");
         }
@@ -960,7 +996,8 @@ void World::step(const std::function<void(World &)> &fixed_update) {
                 b.desc.angular_velocity = limit(b.desc.angular_velocity, w.config.max_angular_speed);
                 const Vec3 center = w.com(b) + b.desc.linear_velocity * h;
                 b.desc.pose.rotation = advance_rotation(b.desc.pose.rotation, b.desc.angular_velocity, h);
-                b.desc.pose.position = center - b.desc.pose.rotation.rotate(b.desc.center_of_mass);
+                b.desc.pose.position = zero(b.desc.center_of_mass)
+                                           ? center : center - b.desc.pose.rotation.rotate(b.desc.center_of_mass);
                 validate_vec(b.desc.pose.position, 8192, "body left supported world range");
             }
         if (dynamic_advanced)
@@ -1021,7 +1058,7 @@ std::vector<QueryHit> World::overlap(const Shape &shape, Pose pose, QueryFilter 
         const auto &p = w.proxies[i];
         for (auto triangle : triangles(c.desc.shape->data(), p.pose, area)) {
             const auto target = geometry(c.desc.shape->data(), p.pose, triangle);
-            const auto s = separate(source, target);
+            const auto s = separate(source, target, 0_r);
             if (s.distance <= 0) {
                 const auto points = manifold(source, target, s, 0);
                 hits.push_back({c.desc.body, c.id, triangle, 0, 0, points.front().point, -s.normal, true});

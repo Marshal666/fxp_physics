@@ -1,40 +1,74 @@
 name: Physics and deterministic replay
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
         platform:
-          - { os: windows-latest, compiler: cl }
-          - { os: ubuntu-latest, compiler: g++ }
-          - { os: ubuntu-latest, compiler: clang++ }
+          - { os: windows-2022, compiler: cl, name: msvc-x64 }
+          - { os: ubuntu-24.04, compiler: g++, name: gcc-x64 }
+          - { os: ubuntu-24.04, compiler: clang++, name: clang-x64 }
+          - { os: macos-14, compiler: clang++, name: clang-arm64 }
         build_type: [Debug, Release]
         portable: ["OFF", "ON"]
     runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
         with:
           arch: x64
-      - name: Configure
+      - name: Configure physics and math tests
         run: >-
           cmake -S . -B build/ci -G Ninja
           -DCMAKE_CXX_COMPILER=${{ matrix.platform.compiler }}
           -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
           -DFXP_PORTABLE_ONLY=${{ matrix.portable }}
           -DFXP_DISABLE_SSE2=${{ matrix.portable }}
-      - run: cmake --build build/ci --parallel
+          -DFXP_BUILD_TESTS=ON
+          -DFXP_PHYSICS_BUILD_BENCHMARKS=ON
+      - run: cmake --build build/ci --parallel 3
+      # Frozen traces are identical across compilers, architectures and backends.
+      # Tests never regenerate either reference.
       - run: ctest --test-dir build/ci --output-on-failure
-  sanitizers:
-    runs-on: ubuntu-latest
+      - name: Measure all requested populations
+        if: matrix.build_type == 'Release'
+        shell: bash
+        run: ./build/ci/fxp_physics_benchmark --suite scaling --ticks 10 --samples 2 > scaling.csv
+      - uses: actions/upload-artifact@v7
+        if: matrix.build_type == 'Release'
+        with:
+          name: scaling-${{ matrix.platform.name }}-portable-${{ matrix.portable }}
+          path: scaling.csv
+          if-no-files-found: error
+  compare_scaling:
+    needs: test
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: scaling-*
+          path: scaling-results
+      - name: Compare all large-scene states across platforms
+        run: python3 benchmarks/compare_results.py scaling-results --expected-files 8
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - run: cmake -S . -B build/sanitize -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DFXP_PHYSICS_SANITIZERS=ON
-      - run: cmake --build build/sanitize --parallel
+      - run: >-
+          cmake -S . -B build/sanitize -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=clang++
+          -DFXP_PHYSICS_SANITIZERS=ON -DFXP_ENABLE_SANITIZERS=ON
+          -DFXP_BUILD_TESTS=ON -DFXP_PORTABLE_ONLY=ON -DFXP_DISABLE_SSE2=ON
+      - run: cmake --build build/sanitize --parallel 3
       - run: ctest --test-dir build/sanitize --output-on-failure

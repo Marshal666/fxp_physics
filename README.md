@@ -159,7 +159,10 @@ are not part of this version. Low-poly terrain and modest hulls are recommended.
 
 ## Contacts, queries and springs
 
-The broadphase uses a deterministic median AABB tree rebuilt for changed poses.
+The broadphase uses a deterministic median AABB tree. Changed bounds refit the
+tree; structural changes and every 32 refits rebuild its spatial partition.
+Query candidates remain sorted by collider ID regardless of tree topology.
+Unchanged colliders retain their bounds and cooked convex geometry.
 Static meshes have a cooked local BVH; terrain queries traverse affected cells.
 Primitive and hull contact tests use analytic segment distances and separating
 axes. Face clipping creates up to four contact points per convex pair; triangle
@@ -275,9 +278,36 @@ never regenerate it as part of configure/build/test.
 .\build\windows-release-portable\fxp_physics_tests.exe --write-reference tests/reference.txt
 ```
 
-`--benchmark` times moving kinematic populations of 100, 1,000 and 10,000 spheres,
-with 100 overlap queries per tick. It uses wall-clock timing only in the test
-executable. This sparse workload measures broadphase/update overhead, not dense
-contact solving. The engine does not promise a frame budget for 10,000 mutually
-colliding or awake dynamic bodies. Treat measured game-scene contact counts and
-query workload as the basis for subsequent optimization.
+`fxp_physics_benchmark` runs without the viewer, window system or downloaded
+dependencies. It reproduces the viewer's physics playground and provides sparse
+kinematic/dynamic spheres and eight-box stacks at 100, 500, 1,000, 5,000 and
+10,000 moving bodies. All use 60 Hz, four substeps and 12 velocity iterations.
+Build it with `FXP_PHYSICS_BUILD_BENCHMARKS=ON`; tests also build it for replay
+validation.
+
+```sh
+./build/linux-release/fxp_physics_benchmark --scene playground --ticks 240 --samples 3
+./build/linux-release/fxp_physics_benchmark --scene dynamic --bodies 10000 --ticks 120 --samples 3 --queries 100
+./build/linux-release/fxp_physics_benchmark --suite scaling --ticks 10 --samples 2 > scaling.csv
+```
+
+CSV output includes mean, median, p95 and maximum tick time, contact/candidate
+counts and full-state/query checksums. Construction, statistics, hashing and
+trace I/O are outside the timed region. Optional overlap queries are timed.
+Each sample recreates the same scene and must end with identical checksums.
+Use `--warmup N` to measure a later simulation interval; timings do not control
+the number of simulated ticks.
+
+`tests/playground_reference.csv` adds 240 frozen state/query/event rows captured
+from the original engine before these optimizations. CI checks both reference
+files on GCC, Clang, MSVC and macOS ARM, Debug/Release, native/portable arithmetic.
+Release artifacts also compare all five populations across platforms and
+backends. Timing numbers are reported, not used as flaky CI pass/fail limits.
+The viewer repository has its own workflow because nested submodule workflows
+do not run on a viewer push.
+
+See [measured performance and reproduction details](docs/performance.md).
+The arithmetic optimizations also modify the nested `fxp_math` dependency; carry
+those changes with this engine when updating submodule revisions. They preserve
+exact rounding, saturation and frozen results without floating-point arithmetic.
+The original `fxp_physics_tests --benchmark` command remains available.

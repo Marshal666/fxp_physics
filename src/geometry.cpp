@@ -152,51 +152,82 @@ std::uint32_t Tree::build_node(std::vector<std::uint32_t> &ids, std::size_t begi
     nodes[index].right = right;
     return index;
 }
-std::vector<std::uint32_t> Tree::query(Bounds b) const {
-    std::vector<std::uint32_t> out;
+void Tree::refit(const std::vector<Bounds> &bounds) {
+    // Children follow their parent in build_node's preorder layout.
+    for (auto i = nodes.size(); i != 0; --i) {
+        auto &node = nodes[i - 1];
+        if (node.item != 0xffffffffu)
+            node.bounds = bounds[node.item];
+        else {
+            node.bounds = nodes[node.left].bounds;
+            node.bounds.add(nodes[node.right].bounds);
+        }
+    }
+}
+void Tree::query(Bounds b, std::vector<std::uint32_t> &out) const {
+    out.clear();
     if (nodes.empty())
-        return out;
-    std::vector<std::uint32_t> stack{0};
-    while (!stack.empty()) {
-        const auto i = stack.back();
-        stack.pop_back();
+        return;
+    // Median splits bound the depth by 32 for 32-bit item indices. Traversal
+    // holds at most one pending sibling per level, plus the current node.
+    std::array<std::uint32_t, 33> stack{};
+    std::size_t size = 1;
+    while (size != 0) {
+        const auto i = stack[--size];
         const auto &n = nodes[i];
         if (!n.bounds.intersects(b))
             continue;
         if (n.item != 0xffffffffu)
             out.push_back(n.item);
         else {
-            stack.push_back(n.right);
-            stack.push_back(n.left);
+            stack[size++] = n.right;
+            stack[size++] = n.left;
         }
     }
     std::sort(out.begin(), out.end());
+}
+std::vector<std::uint32_t> Tree::query(Bounds b) const {
+    std::vector<std::uint32_t> out;
+    query(b, out);
     return out;
+}
+static std::vector<std::pair<std::uint32_t, std::uint32_t>>
+edge_indices(const std::vector<std::vector<std::uint32_t>> &faces) {
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> edges;
+    for (const auto &f : faces)
+        for (std::size_t i = 0; i < f.size(); ++i) {
+            auto a = f[i], b = f[(i + 1) % f.size()];
+            if (a > b)
+                std::swap(a, b);
+            edges.emplace_back(a, b);
+        }
+    std::sort(edges.begin(), edges.end());
+    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
+    return edges;
 }
 static void finish_poly(Geometry &g) {
     g.center = {};
     for (const auto v : g.vertices)
         g.center += v / Real(static_cast<std::int64_t>(g.vertices.size()));
-    for (const auto &f : g.faces) {
+    g.centered_vertices.reserve(g.vertices.size());
+    for (const auto v : g.vertices)
+        g.centered_vertices.push_back(v - g.center);
+    g.normals.reserve(g.faces.size());
+    for (const auto &f : g.faces)
         g.normals.push_back(
             unit(cross(g.vertices[f[1]] - g.vertices[f[0]], g.vertices[f[2]] - g.vertices[f[0]])));
-        for (std::size_t i = 0; i < f.size(); ++i) {
-            auto a = f[i], b = f[(i + 1) % f.size()];
-            if (a > b)
-                std::swap(a, b);
-            g.edges.emplace_back(a, b);
-        }
-    }
-    std::sort(g.edges.begin(), g.edges.end());
-    g.edges.erase(std::unique(g.edges.begin(), g.edges.end()), g.edges.end());
 }
 Geometry geometry(const Shape::Data &s, Pose p, std::uint32_t triangle) {
     Geometry g;
     if (s.type == ShapeType::sphere || s.type == ShapeType::capsule) {
         g.rounded = true;
         g.radius = s.radius;
-        g.a = transform(p, {0, -s.half_segment, 0});
-        g.b = transform(p, {0, s.half_segment, 0});
+        if (s.type == ShapeType::sphere)
+            g.a = g.b = p.position;
+        else {
+            g.a = transform(p, {0, -s.half_segment, 0});
+            g.b = transform(p, {0, s.half_segment, 0});
+        }
         g.center = p.position;
         return g;
     }
@@ -205,6 +236,7 @@ Geometry geometry(const Shape::Data &s, Pose p, std::uint32_t triangle) {
         g.vertices = {transform(p, s.vertices[t.a]), transform(p, s.vertices[t.b]),
                       transform(p, s.vertices[t.c])};
         g.faces = {{0, 1, 2}, {2, 1, 0}};
+        g.edges = {{0, 1}, {0, 2}, {1, 2}};
     } else if (s.type == ShapeType::heightfield) {
         const auto cell = triangle / 2, x = cell % (s.width - 1), z = cell / (s.width - 1);
         const auto vertex = [&](std::uint32_t dx, std::uint32_t dz) {
@@ -215,8 +247,10 @@ Geometry geometry(const Shape::Data &s, Pose p, std::uint32_t triangle) {
         g.vertices = (triangle & 1) ? std::vector<Vec3>{vertex(0, 0), vertex(1, 1), vertex(1, 0)}
                                     : std::vector<Vec3>{vertex(0, 0), vertex(0, 1), vertex(1, 1)};
         g.faces = {{0, 1, 2}, {2, 1, 0}};
+        g.edges = {{0, 1}, {0, 2}, {1, 2}};
     } else {
         g.faces = s.faces;
+        g.edges = s.edges;
         g.vertices.reserve(s.vertices.size());
         for (auto v : s.vertices)
             g.vertices.push_back(transform(p, v));
@@ -260,15 +294,64 @@ Vec3 Geometry::support(Vec3 d) const {
     if (rounded)
         return (dot(a, d) >= dot(b, d) ? a : b) + unit(d) * radius;
     Vec3 best = vertices.front();
-    Real value = dot(best - center, d);
+    Real value = dot(centered_vertices.front(), d);
     for (std::size_t i = 1; i < vertices.size(); ++i) {
-        const Real next = dot(vertices[i] - center, d);
+        const Real next = dot(centered_vertices[i], d);
         if (next > value) {
             value = next;
             best = vertices[i];
         }
     }
     return best;
+}
+const std::vector<Vec3> &Geometry::directions() const {
+    if (edge_directions.empty()) {
+        edge_directions.reserve(edges.size());
+        for (const auto &edge : edges) {
+            const Vec3 direction = unit(vertices[edge.second] - vertices[edge.first]);
+            if (std::find(edge_directions.begin(), edge_directions.end(), direction) == edge_directions.end())
+                edge_directions.push_back(direction);
+        }
+    }
+    return edge_directions;
+}
+// Most primitive pairs need only a few distinct axes. Keep those on the stack,
+// then retain logarithmic lookup for hulls with many edge directions.
+class AxisSet {
+    std::array<Vec3, 32> small_{};
+    std::size_t size_ = 0;
+    std::set<std::tuple<Real, Real, Real>> large_;
+
+  public:
+    bool insert(Vec3 axis) {
+        if (!large_.empty())
+            return large_.emplace(axis.x, axis.y, axis.z).second;
+        const auto end = small_.begin() + static_cast<std::ptrdiff_t>(size_);
+        if (std::find(small_.begin(), end, axis) != end)
+            return false;
+        if (size_ < small_.size()) {
+            small_[size_++] = axis;
+            return true;
+        }
+        for (const auto v : small_)
+            large_.emplace(v.x, v.y, v.z);
+        return large_.emplace(axis.x, axis.y, axis.z).second;
+    }
+};
+static bool tiny_axis(Vec3 axis) {
+    // For integer squared magnitude S, rounded_sqrt(S) < t exactly when
+    // S < t*t - t + 1. Compare raw squares, preserving length()'s rounding
+    // without taking a square root or rounding each component's square.
+    constexpr auto t = static_cast<std::uint64_t>((0.0000001_r).raw_value());
+    constexpr auto limit = t * t - t + 1;
+    std::uint64_t sum = 0;
+    for (unsigned i = 0; i < 3; ++i) {
+        const auto v = fxp::detail::magnitude(axis[i].raw_value());
+        if (v >= t)
+            return false;
+        sum += v * v;
+    }
+    return sum < limit;
 }
 static Vec3 closest_segment(Vec3 a, Vec3 b, Vec3 p) {
     const Vec3 d = b - a;
@@ -295,12 +378,14 @@ static std::pair<Vec3, Vec3> closest_segments(Vec3 a, Vec3 b, Vec3 c, Vec3 d) {
     }
     return {a + u * s, c + v * t};
 }
-Separation separate(const Geometry &a, const Geometry &b) {
+Separation separate(const Geometry &a, const Geometry &b, Real rejection_threshold) {
     Separation result;
     if (a.rounded && b.rounded) {
         const auto closest = closest_segments(a.a, a.b, b.a, b.b);
         const Vec3 delta = closest.second - closest.first;
-        result.normal = unit(delta, unit(b.center - a.center));
+        result.normal = delta;
+        if (!fxp::normalize(&result.normal))
+            result.normal = unit(b.center - a.center);
         result.distance = length(delta) - a.radius - b.radius;
         result.point_a = closest.first + result.normal * a.radius;
         result.point_b = closest.second - result.normal * b.radius;
@@ -308,15 +393,15 @@ Separation separate(const Geometry &a, const Geometry &b) {
     }
     // Exact duplicate axes cannot improve the strict maximum below. Fold
     // opposite signs too, preserving the first tested orientation and all ties.
-    std::set<std::tuple<Real, Real, Real>> tested_axes;
+    AxisSet tested_axes;
     const auto axis = [&](Vec3 n) {
         if (zero(n))
-            return;
+            return false;
         const Vec3 key = (n.x < 0 || (n.x == 0 && (n.y < 0 || (n.y == 0 && n.z < 0)))) ? -n : n;
-        if (!tested_axes.emplace(key.x, key.y, key.z).second)
-            return;
-        if (length(n) < 0.0000001_r)
-            return;
+        if (!tested_axes.insert(key))
+            return false;
+        if (tiny_axis(n))
+            return false;
         n = unit(n);
         const Vec3 ap = a.support(n), am = a.support(-n), bp = b.support(n), bm = b.support(-n);
         const Real positive = dot(bm - ap, n), negative = dot(am - bp, n);
@@ -328,41 +413,38 @@ Separation separate(const Geometry &a, const Geometry &b) {
             result.point_a = flip ? am : ap;
             result.point_b = flip ? bp : bm;
         }
+        return separation > rejection_threshold;
     };
+    // Contact/overlap queries only need a separating witness for rejected
+    // pairs. Accepted pairs still test every axis and retain identical ties.
+    // Casts use the default threshold and require the full maximum distance.
     for (auto n : a.normals)
-        axis(n);
+        if (axis(n))
+            return result;
     for (auto n : b.normals)
-        axis(n);
+        if (axis(n))
+            return result;
     if (!a.rounded && !b.rounded) {
-        // Normalize each edge once, not twice for every edge pair. Identical
-        // fixed-point directions produce identical axes; retain first occurrence
-        // order so separation ties and rounding remain unchanged.
-        const auto directions = [](const Geometry &g) {
-            std::vector<Vec3> out;
-            out.reserve(g.edges.size());
-            for (const auto edge : g.edges) {
-                const Vec3 direction = unit(g.vertices[edge.second] - g.vertices[edge.first]);
-                if (std::find(out.begin(), out.end(), direction) == out.end())
-                    out.push_back(direction);
-            }
-            return out;
-        };
-        const auto da = directions(a), db = directions(b);
+        // Preserve first-occurrence order and ties. Cache lazily because
+        // rounded-vs-poly contacts never need these normalized directions.
+        const auto &da = a.directions(), &db = b.directions();
         for (const auto ea : da)
             for (const auto eb : db)
-                axis(cross(ea, eb));
+                if (axis(cross(ea, eb)))
+                    return result;
     } else {
         const auto &round = a.rounded ? a : b;
         const auto &poly = a.rounded ? b : a;
         for (auto v : poly.vertices)
-            axis(v - closest_segment(round.a, round.b, v));
+            if (axis(v - closest_segment(round.a, round.b, v)))
+                return result;
         for (auto edge : poly.edges) {
             const Vec3 p = poly.vertices[edge.first], q = poly.vertices[edge.second];
             const auto closest = closest_segments(round.a, round.b, p, q);
-            axis(closest.second - closest.first);
-            axis(cross(round.b - round.a, q - p));
-            axis(closest_segment(p, q, round.a) - round.a);
-            axis(closest_segment(p, q, round.b) - round.b);
+            if (axis(closest.second - closest.first) || axis(cross(round.b - round.a, q - p)) ||
+                axis(closest_segment(p, q, round.a) - round.a) ||
+                axis(closest_segment(p, q, round.b) - round.b))
+                return result;
         }
     }
     return result;
@@ -430,13 +512,21 @@ std::vector<ContactPoint> manifold(const Geometry &a, const Geometry &b, Separat
         return out;
     }
     std::size_t fa = 0, fb = 0;
-    for (std::size_t i = 1; i < a.faces.size(); ++i)
-        if (dot(a.normals[i], s.normal) > dot(a.normals[fa], s.normal))
+    Real align_a = dot(a.normals[fa], s.normal), align_b = dot(b.normals[fb], -s.normal);
+    for (std::size_t i = 1; i < a.faces.size(); ++i) {
+        const Real alignment = dot(a.normals[i], s.normal);
+        if (alignment > align_a) {
             fa = i;
-    for (std::size_t i = 1; i < b.faces.size(); ++i)
-        if (dot(b.normals[i], -s.normal) > dot(b.normals[fb], -s.normal))
+            align_a = alignment;
+        }
+    }
+    for (std::size_t i = 1; i < b.faces.size(); ++i) {
+        const Real alignment = dot(b.normals[i], -s.normal);
+        if (alignment > align_b) {
             fb = i;
-    const Real align_a = dot(a.normals[fa], s.normal), align_b = dot(b.normals[fb], -s.normal);
+            align_b = alignment;
+        }
+    }
     if ((std::max)(align_a, align_b) > 0.999_r) {
         const bool use_a = align_a >= align_b;
         const auto &reference = use_a ? a : b;
@@ -444,9 +534,14 @@ std::vector<ContactPoint> manifold(const Geometry &a, const Geometry &b, Separat
         const auto ref_face = use_a ? fa : fb;
         const Vec3 normal = reference.normals[ref_face];
         std::size_t inc_face = 0;
-        for (std::size_t i = 1; i < incident.faces.size(); ++i)
-            if (dot(incident.normals[i], normal) < dot(incident.normals[inc_face], normal))
+        Real inc_alignment = dot(incident.normals[inc_face], normal);
+        for (std::size_t i = 1; i < incident.faces.size(); ++i) {
+            const Real alignment = dot(incident.normals[i], normal);
+            if (alignment < inc_alignment) {
                 inc_face = i;
+                inc_alignment = alignment;
+            }
+        }
         std::vector<Vec3> polygon;
         for (auto i : incident.faces[inc_face])
             polygon.push_back(incident.vertices[i]);
@@ -530,6 +625,10 @@ Geometry translated(Geometry g, Vec3 delta) {
     g.center += delta;
     for (auto &v : g.vertices)
         v += delta;
+    for (std::size_t i = 0; i < g.vertices.size(); ++i)
+        g.centered_vertices[i] = g.vertices[i] - g.center;
+    // Recompute after translation, including any saturated additions.
+    g.edge_directions.clear();
     return g;
 }
 } // namespace detail
@@ -552,6 +651,7 @@ ShapePtr Shape::box(Vec3 half) {
         d->vertices.push_back(
             {(i & 1) ? half.x : -half.x, (i & 2) ? half.y : -half.y, (i & 4) ? half.z : -half.z});
     d->faces = {{0, 4, 6, 2}, {1, 3, 7, 5}, {0, 1, 5, 4}, {2, 6, 7, 3}, {0, 2, 3, 1}, {4, 5, 7, 6}};
+    d->edges = edge_indices(d->faces);
     return ShapePtr(new Shape(d));
 }
 ShapePtr Shape::sphere(Real radius) {
@@ -611,6 +711,7 @@ ShapePtr Shape::convex(std::vector<Vec3> vertices, std::vector<std::vector<std::
     for (auto e : edges)
         require(std::binary_search(edges.begin(), edges.end(), std::make_pair(e.second, e.first)),
                 "hull must be closed");
+    d->edges = edge_indices(d->faces);
     return ShapePtr(new Shape(d));
 }
 ShapePtr Shape::mesh(std::vector<Vec3> vertices, std::vector<Triangle> triangles) {

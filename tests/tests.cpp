@@ -1,4 +1,5 @@
 #include <fxp_physics/physics.hpp>
+#include "../src/detail.hpp"
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -578,6 +579,113 @@ void edge_cases() {
     }
     check(shared.save() == separate_assets.save(), "asset allocation/sharing changed bytes");
 }
+void length_comparisons() {
+    const auto verify = [](Vec3 v, Real threshold) {
+        check(detail::length_greater_than(v, threshold) == (fxp::length(v) > threshold),
+              "raw squared length comparison differs from rounded/saturated length");
+    };
+    const Real raw[] = {Real::min(), Real::max(), Real::from_raw(-1), 0_r,
+                        Real::from_raw(1), 0.08_r, 1_r};
+    for (auto x : raw)
+        for (auto y : raw)
+            for (auto z : raw)
+                for (auto threshold : raw)
+                    verify({x, y, z}, threshold);
+    Random rng(81923);
+    for (unsigned i = 0; i < 4000; ++i) {
+        Vec3 v;
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            auto value = static_cast<std::int64_t>(rng.next() >> 1);
+            // Include tiny magnitudes where rounding individual fixed squares
+            // would discard the length, and near-overflow magnitudes.
+            value >>= (i % 63);
+            v[axis] = Real::from_raw((rng.next() & 1) ? value : -value);
+        }
+        const auto length = fxp::length(v);
+        verify(v, length);
+        verify(v, Real::from_raw(length.raw_value() - 1));
+        if (length != Real::max())
+            verify(v, Real::from_raw(length.raw_value() + 1));
+    }
+}
+
+void rotation_cache() {
+    detail::Rotation cache;
+    Random rng(17823);
+    for (unsigned i = 0; i < 1200; ++i) {
+        Quat q;
+        if (i % 11) {
+            fxp::vec4<Real> components;
+            for (unsigned axis = 0; axis < 4; ++axis)
+                components[axis] = Real(static_cast<int>(rng.bounded(2001)) - 1000) / 1000_r;
+            q = Quat(components);
+            check(q.normalize(), "generated zero rotation");
+        }
+        Vec3 v;
+        for (unsigned axis = 0; axis < 3; ++axis) {
+            auto raw = static_cast<std::int64_t>(rng.next() >> 1);
+            raw >>= i % 63;
+            v[axis] = Real::from_raw((rng.next() & 1) ? raw : -raw);
+        }
+        if (i % 13 == 0)
+            v.x = Real::min();
+        cache.set(q);
+        check(cache.rotate(v) == q.rotate(v), "rotation cache changed fixed-point rounding");
+        check(cache.rotate(v, true) == detail::inverse(q).rotate(v), "inverse rotation cache changed rounding");
+        cache.set(q);
+        check(cache.rotate(v) == q.rotate(v), "reused rotation cache changed result");
+    }
+}
+
+void moving_broadphase() {
+    Config config;
+    config.gravity = {};
+    World queried(config), unqueried(config);
+    const auto sphere = Shape::sphere(0.3_r), probe = Shape::sphere(0.4_r);
+    std::vector<BodyId> ids;
+    for (int i = 0; i < 80; ++i) {
+        const Vec3 p{Real(i % 10) * 2, 0, Real(i / 10) * 2};
+        ids.push_back(add(queried, sphere, p, BodyType::kinematic));
+        check(add(unqueried, sphere, p, BodyType::kinematic) == ids.back(), "body ID mismatch");
+    }
+    for (unsigned tick = 0; tick < 80; ++tick) {
+        if (tick == 20) {
+            // Remove/reinsert without changing population to exercise sparse
+            // IDs and cache invalidation independently of vector size.
+            queried.remove_body(ids[7]);
+            unqueried.remove_body(ids[7]);
+            ids.erase(ids.begin() + 7);
+            ids.push_back(add(queried, sphere, {}, BodyType::kinematic));
+            check(add(unqueried, sphere, {}, BodyType::kinematic) == ids.back(), "replacement ID mismatch");
+        }
+        for (std::size_t i = 0; i < ids.size(); ++i) {
+            const Vec3 p{Real(static_cast<int>((i * 17 + tick * 3) % 41) - 20) / 2_r,
+                         0, Real(static_cast<int>((i * 7 + tick) % 31) - 15) / 2_r};
+            queried.teleport(ids[i], {p, {}});
+            unqueried.teleport(ids[i], {p, {}});
+        }
+        // Force different rebuild/refit histories without different commands.
+        for (std::size_t q = 0; q < 5; ++q) {
+            const Vec3 center = queried.body(ids[q]).properties.pose.position + Vec3{0.25_r, 0, 0};
+            std::vector<BodyId> expected, actual;
+            for (const auto id : ids)
+                if (fxp::length(queried.body(id).properties.pose.position - center) <= 0.7_r)
+                    expected.push_back(id);
+            for (const auto &hit : queried.overlap(*probe, {center, {}}))
+                actual.push_back(hit.body);
+            check(actual == expected, "moving broadphase differs from brute-force oracle");
+        }
+        queried.step();
+        unqueried.step();
+        check(queried.save() == unqueried.save(), "query/refit frequency changed simulation state");
+        if (tick == 40) {
+            World restored;
+            restored.load(unqueried.save());
+            unqueried = std::move(restored);
+        }
+    }
+}
+
 void benchmark() {
     for (int count : {100, 1000, 10000}) {
         Config cfg;
@@ -629,7 +737,10 @@ int main(int argc, char **argv) {
             {"stacks and friction", stacks_and_friction},
             {"springs and surfaces", springs_and_surfaces},
             {"save continuation", save_continuation},
-            {"edge cases and broadphase oracle", edge_cases}};
+            {"edge cases and broadphase oracle", edge_cases},
+            {"exact length comparisons", length_comparisons},
+            {"rotation coefficient cache", rotation_cache},
+            {"moving broadphase and query independence", moving_broadphase}};
         for (const auto &test : tests) {
             test.second();
             std::cout << "PASS: " << test.first << std::endl;
